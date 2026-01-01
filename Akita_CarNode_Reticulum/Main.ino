@@ -14,6 +14,7 @@
 #include <ArduinoJson.h> // For creating JSON payloads
 
 // Core Application Modules
+#include "config_manager.h"  // Runtime configuration management
 #include "ble_handler.h"
 #include "obd_parser.h"
 #include "gps_handler.h"
@@ -55,6 +56,11 @@ unsigned long lastStatusLedUpdateTime = 0;
 
 int currentPIDIndex = 0; // To cycle through OBD_PIDS_TO_QUERY
 
+// Serial command buffer for configuration
+String serialCommandBuffer = "";
+unsigned long lastConfigMenuTime = 0;
+const unsigned long CONFIG_MENU_TIMEOUT_MS = 30000; // Show menu 30s after boot if no activity
+
 void setup() {
 #if ENABLE_SERIAL_DEBUG > 0
     Serial.begin(SERIAL_BAUD_RATE);
@@ -66,7 +72,15 @@ void setup() {
     DEBUG_PRINTF("[INFO] Sketch Version: 1.0.0, Compiled: %s %s\n", __DATE__, __TIME__);
     DEBUG_PRINTF("[INFO] ESP32 Chip Revision: %d, CPU Freq: %d MHz\n", ESP.getChipRevision(), ESP.getCpuFreqMHz());
     DEBUG_PRINTF("[INFO] Free Heap: %u bytes\n", ESP.getFreeHeap());
-    DEBUG_PRINTF("[INFO] Target Vehicle ID: %s\n", VEHICLE_ID);
+#endif
+
+    // Initialize configuration manager FIRST (loads saved config or uses defaults)
+    initConfigManager();
+    
+#if ENABLE_SERIAL_DEBUG > 0
+    DEBUG_PRINTF("[INFO] Vehicle ID: %s\n", getVehicleID());
+    DEBUG_PRINTLN(F("[INFO] Type 'help' or 'config' for configuration menu"));
+    DEBUG_PRINTLN(F("[INFO] Configuration can be changed via serial commands"));
 #endif
 
     setupStatusLed(); // Initialize status LED pins and default state
@@ -78,6 +92,7 @@ void setup() {
     initReticulum();  // Initialize Reticulum stack and chosen interface (WiFi/LoRa)
 
     DEBUG_PRINTLN(F("[INFO] Core setup complete. Starting main loop."));
+    lastConfigMenuTime = millis();
     // Initial status will be attempting connections
     setLedStatus(LED_STATUS_IDLE); // Or a specific "connecting" state
 }
@@ -147,7 +162,7 @@ void loop() {
             StaticJsonDocument<JSON_PAYLOAD_BUFFER_SIZE> jsonDoc;
 
             // Populate JSON document
-            jsonDoc["node_id"] = VEHICLE_ID;
+            jsonDoc["node_id"] = getVehicleID(); // Use runtime configuration
             jsonDoc["timestamp_ms"] = millis(); // Milliseconds since boot as a simple timestamp
 
             if (currentVehicleData.ble_connected) {
@@ -190,6 +205,40 @@ void loop() {
             DEBUG_PRINTLN(F("[DATA_TX_WARN] Reticulum not ready to send data."));
         }
     }
+
+    // 6. Handle Serial Configuration Commands (non-blocking)
+#if ENABLE_SERIAL_DEBUG > 0
+    // Show config menu once after boot if no commands received
+    if (millis() - lastConfigMenuTime < CONFIG_MENU_TIMEOUT_MS && 
+        millis() - lastConfigMenuTime > 5000 && 
+        serialCommandBuffer.length() == 0) {
+        DEBUG_PRINTLN(F("\n[INFO] Type 'help' or 'config' to configure the device"));
+        lastConfigMenuTime = millis() + CONFIG_MENU_TIMEOUT_MS; // Don't show again
+    }
+    
+    // Process serial input for configuration commands
+    while (Serial.available() > 0) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (serialCommandBuffer.length() > 0) {
+                serialCommandBuffer.toLowerCase();
+                if (serialCommandBuffer == "help" || serialCommandBuffer == "config" || serialCommandBuffer == "menu") {
+                    showConfigMenu();
+                } else {
+                    processConfigCommand(serialCommandBuffer);
+                }
+                serialCommandBuffer = "";
+                lastConfigMenuTime = millis(); // Reset timeout
+            }
+        } else if (c >= 32 && c <= 126) { // Printable characters
+            serialCommandBuffer += c;
+            if (serialCommandBuffer.length() > 128) { // Prevent buffer overflow
+                serialCommandBuffer = "";
+                DEBUG_PRINTLN(F("[CONFIG] Command too long, ignored"));
+            }
+        }
+    }
+#endif
 
     // Yield for other tasks, especially important for ESP32 WiFi and BLE stability
     // A small delay can also help prevent watchdog timeouts if any library call is unexpectedly blocking.

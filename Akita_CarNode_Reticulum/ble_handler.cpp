@@ -197,7 +197,7 @@ bool connectBLE() {
         // If we don't have specific UUIDs, try to find common OBD-II service UUIDs
         // Get the services
         std::map<std::string, BLERemoteService*>* services = pClient->getServices();
-        if (services->size() > 0) {
+        if (services != nullptr && services->size() > 0) {
             // Try to find a service that looks like a data service
             for (auto const& service : *services) {
                 String serviceUUID = String(service.first.c_str());
@@ -207,11 +207,11 @@ bool connectBLE() {
                 pRemoteService = pClient->getService(service.first.c_str());
                 if (pRemoteService != nullptr) {
                     std::map<std::string, BLERemoteCharacteristic*>* characteristics = pRemoteService->getCharacteristics();
-                    if (characteristics->size() > 0) {
+                    if (characteristics != nullptr && characteristics->size() > 0) {
                         // Use the first characteristic that supports write/notify
                         for (auto const& characteristic : *characteristics) {
                             BLERemoteCharacteristic* pChar = characteristic.second;
-                            if (pChar->canWrite() || pChar->canNotify() || pChar->canIndicate()) {
+                            if (pChar != nullptr && (pChar->canWrite() || pChar->canNotify() || pChar->canIndicate())) {
                                 pRemoteCharacteristic = pChar;
                                 targetServiceUUID = serviceUUID;
                                 targetCharacteristicUUID = String(characteristic.first.c_str());
