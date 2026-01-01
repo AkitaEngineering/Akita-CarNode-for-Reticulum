@@ -112,6 +112,11 @@ const int NUM_OBD_PIDS = sizeof(OBD_PIDS_TO_QUERY) / sizeof(OBD_PIDS_TO_QUERY[0]
 // Includes vehicle ID, timestamp, OBD data, GPS data, and status flags.
 #define JSON_PAYLOAD_BUFFER_SIZE 512
 
+// Reticulum maximum payload size (after headers)
+// Typical Reticulum packet max payload is around 500 bytes, but can vary by interface
+// This is a conservative estimate - adjust based on your Reticulum library version
+#define RNS_MAX_PAYLOAD_SIZE_AFTER_HEADER 500
+
 // --- Status LED Configuration (Optional) ---
 #define ENABLE_STATUS_LED true
 // Common built-in LED pins: 2 for ESP32-DevKitC, 25 for Heltec WiFi LoRa 32

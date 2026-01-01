@@ -35,6 +35,8 @@ static bool reticulumTransportIsActive = false; // Reticulum stack reports at le
 static unsigned long lastWifiConnectionAttemptTime = 0;
 static unsigned long currentWifiRetryIntervalMs = WIFI_INITIAL_RETRY_DELAY_MS;
 static uint8_t wifiConnectionRetryCount = 0;
+static bool wifiConnectionInProgress = false;
+static unsigned long wifiConnectionStartTime = 0;
 #endif
 
 // Reticulum status callback function
@@ -55,8 +57,9 @@ void rns_status_and_log_callback(Reticulum::LOG_LEVEL level, Reticulum::CONTEXT 
             DEBUG_PRINTLN(F("[RNS_CB] A transport interface is active. Reticulum operational."));
             reticulumTransportIsActive = true; 
             
-            if (reticulum_instance.getIdentity() && reticulum_instance.getIdentity()->isValid()) {
-                local_node_identity = *reticulum_instance.getIdentity(); // Cache local identity
+            Identity* identity = reticulum_instance.getIdentity();
+            if (identity != nullptr && identity->isValid()) {
+                local_node_identity = *identity; // Cache local identity
                 DEBUG_PRINTF("[RNS_CB] Node RNS Address (Identity Hash): %s\n", local_node_identity.getHexHash().c_str());
                 
                 // Announce this node's presence with its application name
@@ -80,8 +83,9 @@ void rns_status_and_log_callback(Reticulum::LOG_LEVEL level, Reticulum::CONTEXT 
         }
     } else if (context == Reticulum::CONTEXT_IDENTITY) {
          if (strstr(message_cst, "Identity created") || strstr(message_cst, "Loaded identity from storage")) {
-            if (reticulum_instance.getIdentity() && reticulum_instance.getIdentity()->isValid()) {
-                local_node_identity = *reticulum_instance.getIdentity(); // Cache it
+            Identity* identity = reticulum_instance.getIdentity();
+            if (identity != nullptr && identity->isValid()) {
+                local_node_identity = *identity; // Cache it
                 DEBUG_PRINTF("[RNS_CB] Local RNS Identity available: %s\n", local_node_identity.getHexHash().c_str());
             }
          }
@@ -111,8 +115,10 @@ void initReticulum() {
     LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DI0_PIN);             // Set LoRa chip pins
 
     if (!LoRa.begin(LORA_BAND)) { // Initialize LoRa module at specified frequency
-        DEBUG_PRINTLN(F("[RNS_INIT_ERROR] Starting LoRa failed! Check hardware, pins, and antenna. Halting."));
-        while (1) { delay(1000); } // Fatal error for LoRa setup
+        DEBUG_PRINTLN(F("[RNS_INIT_ERROR] Starting LoRa failed! Check hardware, pins, and antenna."));
+        // Don't halt - allow system to continue, LoRa will be retried if needed
+        reticulumPhysicalLayerIsUp = false;
+        return;
     }
     // Optional: Configure LoRa parameters like TxPower, SpreadingFactor, Bandwidth, SyncWord, CRC
     // LoRa.setTxPower(17); // Example: 17dBm, check regional limits and module capability
@@ -205,28 +211,15 @@ void reticulumLoop() {
 
         // Attempt to reconnect WiFi if it's time based on exponential backoff
         unsigned long currentMillis = millis();
-        if (currentMillis - lastWifiConnectionAttemptTime >= currentWifiRetryIntervalMs) {
-            lastWifiConnectionAttemptTime = currentMillis; // Timestamp this connection attempt
-            DEBUG_PRINTF("[RNS_LOOP_WiFi] Attempting WiFi connection (Retry #%d, Current Delay %lums) to SSID: %s\n",
-                         wifiConnectionRetryCount, currentWifiRetryIntervalMs, WIFI_SSID);
-            
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Initiate WiFi connection (non-blocking start)
-            
-            unsigned long connectionAttemptStartTime = millis();
-            bool connectionTimedOut = false;
-            // Wait for connection success or timeout
-            while (WiFi.status() != WL_CONNECTED && !connectionTimedOut) {
-                if (millis() - connectionAttemptStartTime > WIFI_CONNECT_TIMEOUT_MS) {
-                    connectionTimedOut = true;
-                }
-                delay(100); // Brief delay to allow WiFi stack to process
-                DEBUG_PRINT(".");
-            }
-
+        
+        // Check if a connection attempt is in progress
+        if (wifiConnectionInProgress) {
+            // Check if connection succeeded
             if (WiFi.status() == WL_CONNECTED) {
-                DEBUG_PRINTLN(F("\n[RNS_LOOP_WiFi] WiFi (Re)Connected successfully!"));
+                DEBUG_PRINTLN(F("[RNS_LOOP_WiFi] WiFi (Re)Connected successfully!"));
                 DEBUG_PRINTF("[RNS_LOOP_WiFi] IP Address: %s, RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
                 reticulumPhysicalLayerIsUp = true;
+                wifiConnectionInProgress = false;
                 currentWifiRetryIntervalMs = WIFI_INITIAL_RETRY_DELAY_MS; // Reset retry delay for next time
                 wifiConnectionRetryCount = 0; // Reset retry count
 
@@ -236,7 +229,11 @@ void reticulumLoop() {
                     DEBUG_PRINTLN(F("[RNS_LOOP_WiFi] Creating and adding new WiFiInterface to Reticulum."));
                     // The WiFiInterface constructor likely takes the Reticulum instance and the ESP32 WiFiClass instance.
                     wifi_rns_interface_ptr = new WiFiInterface(&reticulum_instance, &WiFi); // Pass ESP32 WiFi object by pointer
-                    reticulum_instance.addInterface(wifi_rns_interface_ptr);
+                    if (wifi_rns_interface_ptr != nullptr) {
+                        reticulum_instance.addInterface(wifi_rns_interface_ptr);
+                    } else {
+                        DEBUG_PRINTLN(F("[RNS_LOOP_WiFi_ERROR] Failed to allocate WiFiInterface."));
+                    }
                 } else {
                     // If the Reticulum WiFiInterface object already exists:
                     // Option 1: The interface object itself detects WiFi state changes (because it has &WiFi) and re-initializes. (Ideal)
@@ -251,17 +248,31 @@ void reticulumLoop() {
                 }
                 // Reticulum's status callback (rns_status_and_log_callback) should set reticulumTransportIsActive = true
                 // when the interface is fully up and operational within the RNS stack.
-            } else { // WiFi connection attempt failed or timed out
-                DEBUG_PRINTLN(F("\n[RNS_LOOP_WiFi_ERROR] WiFi connection attempt failed or timed out."));
+            } 
+            // Check if connection attempt timed out
+            else if (currentMillis - wifiConnectionStartTime > WIFI_CONNECT_TIMEOUT_MS) {
+                DEBUG_PRINTLN(F("[RNS_LOOP_WiFi_ERROR] WiFi connection attempt timed out."));
                 WiFi.disconnect(true); // Disconnect fully to clean up state
-                delay(100);            // Small delay for WiFi system to settle
+                wifiConnectionInProgress = false;
 
                 wifiConnectionRetryCount++;
-                unsigned long delayCalculation = WIFI_INITIAL_RETRY_DELAY_MS * pow(2, wifiConnectionRetryCount > 0 ? wifiConnectionRetryCount -1: 0);
-                currentWifiRetryIntervalMs = min(delayCalculation, WIFI_MAX_RETRY_DELAY_MS);
+                unsigned long delayCalculation = WIFI_INITIAL_RETRY_DELAY_MS * pow(2, wifiConnectionRetryCount > 0 ? wifiConnectionRetryCount - 1 : 0);
+                currentWifiRetryIntervalMs = min(delayCalculation, (unsigned long)WIFI_MAX_RETRY_DELAY_MS);
                 currentWifiRetryIntervalMs += random(0, WIFI_RETRY_JITTER_MS + 1); // Add jitter
                 DEBUG_PRINTF("[RNS_LOOP_WiFi] Next WiFi connection attempt in approx %lums.\n", currentWifiRetryIntervalMs);
+                lastWifiConnectionAttemptTime = currentMillis; // Update for next retry timing
             }
+            // Connection still in progress, continue waiting (non-blocking)
+        }
+        // Start a new connection attempt if it's time
+        else if (currentMillis - lastWifiConnectionAttemptTime >= currentWifiRetryIntervalMs) {
+            lastWifiConnectionAttemptTime = currentMillis; // Timestamp this connection attempt
+            wifiConnectionStartTime = currentMillis;
+            wifiConnectionInProgress = true;
+            DEBUG_PRINTF("[RNS_LOOP_WiFi] Attempting WiFi connection (Retry #%d, Current Delay %lums) to SSID: %s\n",
+                         wifiConnectionRetryCount, currentWifiRetryIntervalMs, WIFI_SSID);
+            
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Initiate WiFi connection (non-blocking start)
         }
     }
 #endif // END USE_WIFI_FOR_RETICULUM
@@ -293,6 +304,8 @@ void sendDataOverReticulum(const char* jsonDataPayload) {
         
         // **VERIFY** Packet constructor. It typically needs Destination, data buffer (as const uint8_t*), and length.
         // Context like app_name is usually embedded within the Destination's aspects already.
+        // Note: ESP32 Arduino doesn't support exceptions, so error checking is done via return values
+        // **VERIFY** Packet constructor and isValid() method - adjust based on your Reticulum library version
         Packet data_packet(
             specific_rns_destination_ptr,       // Pointer to the Destination object
             (const uint8_t*)jsonDataPayload,    // Data must be cast to const uint8_t*
@@ -301,6 +314,12 @@ void sendDataOverReticulum(const char* jsonDataPayload) {
             // Packet::types type = Packet::TYPE_DATA (often default)
             // Reticulum::Transport::contexts context = Reticulum::Transport::CONTEXT_APP (often default)
         );
+        
+        // **VERIFY** If Packet has isValid() method, uncomment this check:
+        // if (!data_packet.isValid()) {
+        //     DEBUG_PRINTLN(F("[RNS_SEND_ERROR] Failed to create valid packet object."));
+        //     return;
+        // }
         
         Packet::LXMFDeliveryStatus deliveryStatus = data_packet.send(); // Send the packet
         
@@ -319,6 +338,8 @@ void sendDataOverReticulum(const char* jsonDataPayload) {
         
         // **VERIFY** announceData or similar method for data payloads.
         // It likely requires the announcing Identity, data buffer, length, app_name, and specific aspects.
+        // Note: ESP32 Arduino doesn't support exceptions, so error checking is done via return values
+        // **VERIFY** announceData return type - it may return void, bool, or int depending on library version
         reticulum_instance.announceData( // This is a plausible API, verify exact name and parameters
             *data_announcement_identity_ptr,    // The Identity making this announcement (this node's identity)
             (const uint8_t*)jsonDataPayload,    // Data buffer
@@ -329,13 +350,15 @@ void sendDataOverReticulum(const char* jsonDataPayload) {
             // Potentially more aspects can be added if the API supports varargs or an array for aspects
         );
         // Announce is typically fire-and-forget, no direct delivery status like unicast packets.
+        // **VERIFY** If announceData returns a status, check it here
         DEBUG_PRINTLN(F("[RNS_SEND] Data announced on the network."));
     } else { // Fallback if neither specific destination nor announcement identity is ready
         DEBUG_PRINTLN(F("[RNS_SEND_ERROR] No specific RNS destination and no valid local identity for announcement. Cannot send data."));
         // This might happen if transport is active but local_node_identity hasn't been fully established/cached yet.
         // Try to re-cache local identity if it seems available now.
-        if (!local_node_identity.isValid() && reticulum_instance.getIdentity() && reticulum_instance.getIdentity()->isValid()){
-            local_node_identity = *reticulum_instance.getIdentity();
+        Identity* identity = reticulum_instance.getIdentity();
+        if (!local_node_identity.isValid() && identity != nullptr && identity->isValid()){
+            local_node_identity = *identity;
             if (specific_rns_destination_ptr == nullptr) { // If still no specific dest, set up for announce
                  data_announcement_identity_ptr = &local_node_identity;
             }

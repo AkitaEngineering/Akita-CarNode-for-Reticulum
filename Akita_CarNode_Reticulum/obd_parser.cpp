@@ -28,6 +28,14 @@ void parseOBDResponse(const char* rawSinglePIDResponse, const OBD_PID& pidRule,
                       float* rpm_val, float* speed_kmh_val, float* coolant_temp_c_val
                       /*, float* intake_air_temp_c_val, ... */) {
 
+    // Null pointer checks
+    if (rawSinglePIDResponse == nullptr || pidRule.code == nullptr || 
+        pidRule.responsePrefix == nullptr || rpm_val == nullptr || 
+        speed_kmh_val == nullptr || coolant_temp_c_val == nullptr) {
+        DEBUG_PRINTLN(F("[OBD_PARSE_ERROR] Null pointer passed to parseOBDResponse."));
+        return;
+    }
+
     // rawSinglePIDResponse is expected to be a cleaned string for ONE PID,
     // e.g., "410C0A6B" (no spaces, already matched by pidRule.responsePrefix).
     // pidRule.responsePrefix is like "410C".
@@ -35,7 +43,12 @@ void parseOBDResponse(const char* rawSinglePIDResponse, const OBD_PID& pidRule,
 
     // Data bytes start after the prefix (e.g., after "410C").
     // Length of prefix is 4 characters (e.g. "41" + two hex chars of PID like "0C").
-    const char* dataBytesStart = rawSinglePIDResponse + strlen(pidRule.responsePrefix);
+    size_t prefixLen = strlen(pidRule.responsePrefix);
+    if (strlen(rawSinglePIDResponse) < prefixLen) {
+        DEBUG_PRINTLN(F("[OBD_PARSE_ERROR] Response too short for prefix."));
+        return;
+    }
+    const char* dataBytesStart = rawSinglePIDResponse + prefixLen;
     int dataBytesHexLength = strlen(dataBytesStart);
 
     // --- Engine RPM (PID 010C) ---

@@ -1,7 +1,7 @@
 #include "gps_handler.h"
 #include "config.h"     // For ENABLE_GPS, GPS pins, baud rate, DEBUG_PRINT macros
 #include <TinyGPS++.h>  // GPS parsing library
-#include <Arduino.h>    // For Serial, SoftwareSerial (if used)
+#include <Arduino.h>    // For Serial, HardwareSerial
 
 #if ENABLE_GPS
 
@@ -9,35 +9,34 @@
 TinyGPSPlus gpsParser;
 
 // Serial interface for GPS
-// Option 1: SoftwareSerial (default as per typical config)
-// SoftwareSerial gpsHwSerial(GPS_RX_PIN, GPS_TX_PIN); // Name it gpsHwSerial to avoid conflict if HardwareSerial is also used
-// #define GPS_SERIAL_PORT gpsHwSerial
-
-// Option 2: HardwareSerial (more reliable, if available and pins match)
-// Example: if GPS_RX_PIN is 16 and GPS_TX_PIN is 17 for ESP32's Serial2
-// HardwareSerial& gpsHwSerial = Serial2; // Use Serial1 or Serial2 as appropriate
-// #define GPS_SERIAL_PORT gpsHwSerial
-
-// For this implementation, we will stick to SoftwareSerial as per the typical config.h structure.
-// If you use HardwareSerial, adjust the definition of GPS_SERIAL_PORT and the initGPS().
-SoftwareSerial softwareGpsSerial(GPS_RX_PIN, GPS_TX_PIN);
-#define GPS_SERIAL_PORT softwareGpsSerial
+// ESP32 has multiple HardwareSerial ports available
+// Using Serial2 for GPS (Serial is used for debug, Serial1 may conflict with some boards)
+// Note: GPS_RX_PIN connects to GPS TX (we receive from GPS)
+//       GPS_TX_PIN connects to GPS RX (we send to GPS, often not needed)
+HardwareSerial gpsSerial(2); // Use Serial2
+#define GPS_SERIAL_PORT gpsSerial
 
 
 void initGPS() {
 #if ENABLE_SERIAL_DEBUG > 0
-    DEBUG_PRINTF("[GPS_INIT] Initializing GPS module: Serial interface on RX:%d, TX:%d at %d baud.\n",
+    DEBUG_PRINTF("[GPS_INIT] Initializing GPS module: HardwareSerial(2) on RX:%d, TX:%d at %d baud.\n",
                  GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD_RATE);
 #endif
-    GPS_SERIAL_PORT.begin(GPS_BAUD_RATE);
+    GPS_SERIAL_PORT.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     DEBUG_PRINTLN(F("[GPS_INIT] GPS Serial Interface started. Waiting for NMEA data..."));
 }
 
 void readGPS(bool* fix_status, float* lat_val, float* lon_val,
              float* alt_m_val, uint8_t* sats_val, float* speed_kmh_val) {
     
+    // Null pointer checks
+    if (fix_status == nullptr || lat_val == nullptr || lon_val == nullptr || 
+        alt_m_val == nullptr || sats_val == nullptr || speed_kmh_val == nullptr) {
+        return;
+    }
+    
     if (!ENABLE_GPS) { // Should not be called if disabled, but as a safeguard
-        if(fix_status) *fix_status = false;
+        *fix_status = false;
         return;
     }
 
