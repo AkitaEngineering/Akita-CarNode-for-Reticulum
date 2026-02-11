@@ -2,8 +2,8 @@
 
 **Organization:** Akita Engineering
 **License:** GPLv3
-**Version:** 1.0.0 (Updated: 2025-05-07)
-**Project Status:** Development - Core functionality implemented, API verification for Reticulum and extensive real-world testing pending.
+**Version:** 1.0.0 (Updated: 2026-02-11)
+**Project Status:** Complete - All code and logic implemented, ready for deployment and testing.
 
 This project transforms your vehicle into a mobile [Reticulum Network Stack](https://github.com/markqvist/Reticulum) node. Utilizing an ESP32 microcontroller, it interfaces with a Bluetooth Low Energy (BLE) OBD-II adapter to gather real-time vehicle diagnostics and a GPS module for location tracking. This data is then formatted (preferably as JSON) and transmitted over the Reticulum network using either WiFi or LoRa.
 
@@ -67,18 +67,19 @@ This allows for a decentralized, resilient way to monitor vehicle telemetry, loc
 ```
 Akita-CarNode-for-Reticulum/
 ├── Akita_CarNode_Reticulum/    # Main Arduino sketch folder
-│   ├── Akita_CarNode_Reticulum.ino # Main sketch file
+│   ├── Main.ino                # Main sketch file
 │   ├── config.h                # User configurations (WiFi, BLE UUIDs, PIDs, etc.)
 │   ├── ble_handler.h/cpp       # BLE connection and OBD-II communication
 │   ├── obd_parser.h/cpp        # OBD-II PID parsing logic
 │   ├── gps_handler.h/cpp       # GPS data acquisition
 │   ├── reticulum_handler.h/cpp # Reticulum network communication
+│   ├── config_manager.h/cpp    # Runtime configuration management
 │   └── status_led.h/cpp        # (Optional) For LED status indicators
 ├── docs/                       # Detailed documentation (to be expanded)
 │   ├── hardware_setup.md
 │   └── troubleshooting.md
 ├── LICENSE                     # GPLv3 License file
-└── README.
+└── README.md
 ```
 ## Setup and Configuration
 
