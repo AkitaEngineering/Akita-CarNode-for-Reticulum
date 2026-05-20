@@ -7,6 +7,7 @@
 
 #include "akita_board.h"
 #include "akita_config_store.h"
+#include "akita_transport.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -85,6 +86,13 @@ static const char kConfigPage[] =
 "          <label>GPS baud<input name=\"gps_uart_baud\" type=\"number\" min=\"1200\" max=\"921600\"></label>\n"
 "          <label class=\"checkbox\"><input type=\"checkbox\" name=\"enable_gps\">Enable GPS reader</label>\n"
 "        </section>\n"
+"        <section class=\"panel\">\n"
+"          <h2>Runtime Status</h2>\n"
+"          <label>Transport ready<input name=\"transport_status_ready\" disabled></label>\n"
+"          <label>Reticulum bridge ready<input name=\"bridge_status_ready\" disabled></label>\n"
+"          <label>Reticulum bridge mode<input name=\"bridge_status_mode\" disabled></label>\n"
+"          <label>Reticulum last error<input name=\"bridge_status_error\" disabled></label>\n"
+"        </section>\n"
 "      </div>\n"
 "      <div class=\"actions\">\n"
 "        <button type=\"submit\">Save configuration</button>\n"
@@ -96,20 +104,39 @@ static const char kConfigPage[] =
 "  <script>\n"
 "    const form = document.getElementById('config-form');\n"
 "    const statusNode = document.getElementById('status');\n"
+"    function setFieldValue(name, value) {\n"
+"      const field = form.elements.namedItem(name);\n"
+"      if (!field) return;\n"
+"      if (field.type === 'checkbox') field.checked = Boolean(value);\n"
+"      else field.value = value ?? '';\n"
+"    }\n"
+"    function refreshStatus() {\n"
+"      fetch('/api/status').then(r => r.json()).then(data => {\n"
+"        setFieldValue('transport_status_ready', data.transport_ready ? 'yes' : 'no');\n"
+"        setFieldValue('bridge_status_ready', data.bridge_ready ? 'yes' : 'no');\n"
+"        setFieldValue('bridge_status_mode', data.bridge_mode || 'inactive');\n"
+"        setFieldValue('bridge_status_error', data.bridge_last_error || '');\n"
+"      }).catch(() => {\n"
+"        setFieldValue('transport_status_ready', 'unknown');\n"
+"        setFieldValue('bridge_status_ready', 'unknown');\n"
+"        setFieldValue('bridge_status_mode', 'unknown');\n"
+"        setFieldValue('bridge_status_error', 'status fetch failed');\n"
+"      });\n"
+"    }\n"
 "    fetch('/api/config').then(r => r.json()).then(data => {\n"
 "      Object.entries(data).forEach(([key, value]) => {\n"
-"        const field = form.elements.namedItem(key);\n"
-"        if (!field) return;\n"
-"        if (field.type === 'checkbox') field.checked = Boolean(value);\n"
-"        else field.value = value ?? '';\n"
+"        setFieldValue(key, value);\n"
 "      });\n"
-"    }).catch(() => { statusNode.textContent = 'Unable to load saved configuration.'; });\n"
+"      refreshStatus();\n"
+"      window.setInterval(refreshStatus, 3000);\n"
+"    }).catch(() => { statusNode.textContent = 'Unable to load saved configuration.'; refreshStatus(); });\n"
 "    form.addEventListener('submit', async event => {\n"
 "      event.preventDefault();\n"
 "      statusNode.textContent = 'Saving...';\n"
 "      const payload = new URLSearchParams(new FormData(form));\n"
 "      const response = await fetch('/api/config', { method: 'POST', body: payload });\n"
 "      statusNode.textContent = await response.text();\n"
+"      refreshStatus();\n"
 "    });\n"
 "  </script>\n"
 "</body>\n"
@@ -273,6 +300,30 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t akita_status_json_handler(httpd_req_t *request) {
+    akita_transport_status_t transport_status = {0};
+    char bridge_mode[32];
+    char bridge_last_error[128];
+    char response[384];
+
+    akita_transport_get_status(&transport_status);
+    akita_json_escape(transport_status.bridge_mode, bridge_mode, sizeof(bridge_mode));
+    akita_json_escape(transport_status.bridge_last_error, bridge_last_error, sizeof(bridge_last_error));
+
+    snprintf(
+        response,
+        sizeof(response),
+        "{\"transport_ready\":%s,\"bridge_ready\":%s,\"bridge_mode\":\"%s\",\"bridge_last_error\":\"%s\"}",
+        transport_status.transport_ready ? "true" : "false",
+        transport_status.bridge_ready ? "true" : "false",
+        bridge_mode,
+        bridge_last_error
+    );
+
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     char body[1024];
     char scratch[128];
@@ -415,6 +466,12 @@ esp_err_t akita_config_ui_start(akita_runtime_config_t *config) {
         .handler = akita_config_post_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t api_status_uri = {
+        .uri = "/api/status",
+        .method = HTTP_GET,
+        .handler = akita_status_json_handler,
+        .user_ctx = NULL,
+    };
 
     if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -432,6 +489,7 @@ esp_err_t akita_config_ui_start(akita_runtime_config_t *config) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &root_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_post_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_status_uri));
     g_http_running = true;
     return ESP_OK;
 }

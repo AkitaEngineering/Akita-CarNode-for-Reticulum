@@ -41,6 +41,13 @@ Current runtime fields:
 * telemetry interval
 * GPS enable flag
 
+The config portal also exposes a live runtime status panel for:
+
+* transport ready
+* Reticulum bridge ready
+* Reticulum bridge mode
+* last Reticulum bridge error
+
 ## Config Portal Flow
 
 1. Flash the firmware.
@@ -64,6 +71,7 @@ Current runtime fields:
 * The transport component now supports native WiFi uplink to `http://`, `udp://host:port`, and `rns+udp://host:port` endpoints.
 * `rns+udp://host:port` expects the bundled `tools/akita_reticulum_bridge.py` utility or another compatible bridge on the target host.
 * The bundled bridge responds to `ping` and `telemetry` requests. The firmware treats the Reticulum bridge endpoint as ready only after one of those requests is acknowledged successfully.
+* Directed bridge delivery retries with exponential backoff before returning an error. Use the bridge flags `--delivery-attempts`, `--delivery-backoff-seconds`, `--delivery-backoff-factor`, and `--delivery-backoff-max` to tune that behavior.
 * The LoRa transport path is currently transmit-only and targets SX127x-class boards such as Heltec LoRa 32 V2.
 * A full native Reticulum implementation on-device is still pending.
 * The OBD component now uses a native BLE GATT client for common ELM327-style and Nordic UART style adapters.

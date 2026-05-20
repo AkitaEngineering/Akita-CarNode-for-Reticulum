@@ -141,6 +141,10 @@ The firmware will forward telemetry to that UDP bridge, and the bridge will inje
 
 The bridge now answers `ping` and `telemetry` requests with structured acknowledgements. For `rns+udp://` endpoints, the firmware only reports the transport as ready after the bridge has acknowledged a request, so bridge reachability is no longer inferred from WiFi link state alone.
 
+The config portal now exposes live bridge status fields for transport readiness, bridge readiness, bridge mode, and the last bridge error without needing serial logs.
+
+Directed bridge delivery also retries with exponential backoff before returning an error. You can tune that behavior from the bridge process with flags such as `--delivery-attempts`, `--delivery-backoff-seconds`, `--delivery-backoff-factor`, and `--delivery-backoff-max`.
+
 ## Design Direction
 
 This refactor is intentionally pushing the repository toward a thinner, more predictable firmware base:

@@ -26,6 +26,8 @@
 #define AKITA_TRANSPORT_HTTP_TIMEOUT_MS 8000
 #define AKITA_TRANSPORT_UDP_HOST_MAX_LEN 80
 #define AKITA_TRANSPORT_UDP_PORT_MAX_LEN 8
+#define AKITA_TRANSPORT_BRIDGE_MODE_MAX_LEN 16
+#define AKITA_TRANSPORT_BRIDGE_ERROR_MAX_LEN 64
 #define AKITA_TRANSPORT_RNS_PROTOCOL "akita-rns-udp-v2"
 #define AKITA_TRANSPORT_RNS_RESPONSE_MAX_LEN 256
 #define AKITA_TRANSPORT_RNS_TIMEOUT_MS 1500
@@ -95,6 +97,16 @@ static bool g_wifi_transport_enabled;
 static uint32_t g_rns_bridge_sequence;
 static akita_transport_mode_t g_transport_mode;
 static akita_transport_endpoint_t g_endpoint_type;
+static char g_rns_bridge_mode[AKITA_TRANSPORT_BRIDGE_MODE_MAX_LEN] = "inactive";
+static char g_rns_bridge_last_error[AKITA_TRANSPORT_BRIDGE_ERROR_MAX_LEN];
+
+static void akita_transport_copy_string(char *destination, size_t destination_size, const char *source) {
+    if (destination == NULL || destination_size == 0U) {
+        return;
+    }
+
+    snprintf(destination, destination_size, "%s", source != NULL ? source : "");
+}
 
 static void akita_transport_update_ready_state(void) {
     switch (g_transport_mode) {
@@ -125,6 +137,8 @@ static void akita_transport_disable_wifi_uplink(void) {
     esp_err_t err;
 
     g_rns_bridge_ready = false;
+    akita_transport_copy_string(g_rns_bridge_mode, sizeof(g_rns_bridge_mode), "inactive");
+    g_rns_bridge_last_error[0] = '\0';
     g_wifi_transport_enabled = false;
     g_wifi_connected = false;
     if (g_wifi_event_group != NULL) {
@@ -141,6 +155,47 @@ static void akita_transport_disable_wifi_uplink(void) {
 static void akita_transport_set_rns_bridge_ready(bool ready) {
     g_rns_bridge_ready = ready;
     akita_transport_update_ready_state();
+}
+
+static void akita_transport_set_rns_bridge_state(bool ready, const char *mode, const char *last_error) {
+    g_rns_bridge_ready = ready;
+    akita_transport_copy_string(g_rns_bridge_mode, sizeof(g_rns_bridge_mode), mode);
+    akita_transport_copy_string(g_rns_bridge_last_error, sizeof(g_rns_bridge_last_error), last_error);
+    akita_transport_update_ready_state();
+}
+
+static bool akita_transport_json_extract_string(
+    const char *json,
+    const char *key,
+    char *output,
+    size_t output_size
+) {
+    char pattern[32];
+    const char *cursor;
+    size_t used = 0;
+
+    if (json == NULL || key == NULL || output == NULL || output_size == 0U) {
+        return false;
+    }
+
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    cursor = strstr(json, pattern);
+    if (cursor == NULL) {
+        output[0] = '\0';
+        return false;
+    }
+
+    cursor += strlen(pattern);
+    while (*cursor != '\0' && *cursor != '"' && (used + 1U) < output_size) {
+        if (*cursor == '\\' && cursor[1] != '\0') {
+            ++cursor;
+        }
+
+        output[used++] = *cursor++;
+    }
+
+    output[used] = '\0';
+    return used > 0U;
 }
 
 static bool akita_transport_pin_is_valid(int32_t pin) {
@@ -476,6 +531,9 @@ static void akita_transport_wifi_event_handler(
         if (g_wifi_event_group != NULL) {
             xEventGroupClearBits(g_wifi_event_group, AKITA_TRANSPORT_WIFI_CONNECTED_BIT);
         }
+        if (g_endpoint_type == AKITA_TRANSPORT_ENDPOINT_RNS_UDP) {
+            akita_transport_set_rns_bridge_state(false, "waiting", "wifi_disconnected");
+        }
         akita_transport_update_ready_state();
 
         if (g_wifi_transport_enabled) {
@@ -604,6 +662,10 @@ static esp_err_t akita_transport_configure_wifi(const akita_runtime_config_t *co
             ESP_LOGW(TAG, "Unsupported telemetry endpoint scheme: %s", config->telemetry_endpoint);
         }
         return ESP_OK;
+    }
+
+    if (g_endpoint_type == AKITA_TRANSPORT_ENDPOINT_RNS_UDP) {
+        akita_transport_set_rns_bridge_state(false, "waiting", "");
     }
 
     err = akita_transport_ensure_network_base();
@@ -957,17 +1019,30 @@ static esp_err_t akita_transport_ping_rns_bridge(const akita_runtime_config_t *c
 
     err = akita_transport_exchange_rns_udp(config, "ping", NULL, response, sizeof(response));
     if (err != ESP_OK) {
-        akita_transport_set_rns_bridge_ready(false);
+        akita_transport_set_rns_bridge_state(false, "error", esp_err_to_name(err));
         return err;
     }
 
     if (!akita_transport_rns_response_ok(response)) {
+        char message[AKITA_TRANSPORT_BRIDGE_ERROR_MAX_LEN];
+
+        if (!akita_transport_json_extract_string(response, "message", message, sizeof(message))) {
+            akita_transport_copy_string(message, sizeof(message), "bridge_error");
+        }
         ESP_LOGW(TAG, "Reticulum bridge ping failed: %s", response);
-        akita_transport_set_rns_bridge_ready(false);
+        akita_transport_set_rns_bridge_state(false, "error", message);
         return ESP_FAIL;
     }
 
-    akita_transport_set_rns_bridge_ready(true);
+    {
+        char mode[AKITA_TRANSPORT_BRIDGE_MODE_MAX_LEN];
+
+        if (!akita_transport_json_extract_string(response, "mode", mode, sizeof(mode))) {
+            akita_transport_copy_string(mode, sizeof(mode), "bridge_ready");
+        }
+
+        akita_transport_set_rns_bridge_state(true, mode, "");
+    }
     return ESP_OK;
 }
 
@@ -994,17 +1069,30 @@ static esp_err_t akita_transport_publish_rns_udp(const akita_runtime_config_t *c
 
     err = akita_transport_exchange_rns_udp(config, "telemetry", payload, response, sizeof(response));
     if (err != ESP_OK) {
-        akita_transport_set_rns_bridge_ready(false);
+        akita_transport_set_rns_bridge_state(false, "error", esp_err_to_name(err));
         return err;
     }
 
     if (!akita_transport_rns_response_ok(response)) {
+        char message[AKITA_TRANSPORT_BRIDGE_ERROR_MAX_LEN];
+
+        if (!akita_transport_json_extract_string(response, "message", message, sizeof(message))) {
+            akita_transport_copy_string(message, sizeof(message), "bridge_error");
+        }
         ESP_LOGW(TAG, "Reticulum bridge rejected telemetry: %s", response);
-        akita_transport_set_rns_bridge_ready(false);
+        akita_transport_set_rns_bridge_state(false, "error", message);
         return ESP_FAIL;
     }
 
-    akita_transport_set_rns_bridge_ready(true);
+    {
+        char mode[AKITA_TRANSPORT_BRIDGE_MODE_MAX_LEN];
+
+        if (!akita_transport_json_extract_string(response, "mode", mode, sizeof(mode))) {
+            akita_transport_copy_string(mode, sizeof(mode), "ok");
+        }
+
+        akita_transport_set_rns_bridge_state(true, mode, "");
+    }
     return ESP_OK;
 }
 
@@ -1117,6 +1205,18 @@ esp_err_t akita_transport_publish(const akita_runtime_config_t *config, const ch
 
 bool akita_transport_ready(void) {
     return g_transport_ready;
+}
+
+void akita_transport_get_status(akita_transport_status_t *status) {
+    if (status == NULL) {
+        return;
+    }
+
+    memset(status, 0, sizeof(*status));
+    status->transport_ready = g_transport_ready;
+    status->bridge_ready = g_rns_bridge_ready;
+    akita_transport_copy_string(status->bridge_mode, sizeof(status->bridge_mode), g_rns_bridge_mode);
+    akita_transport_copy_string(status->bridge_last_error, sizeof(status->bridge_last_error), g_rns_bridge_last_error);
 }
 
 const char *akita_transport_name(const akita_runtime_config_t *config) {

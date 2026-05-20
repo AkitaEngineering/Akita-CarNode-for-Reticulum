@@ -92,8 +92,9 @@ Check the following:
 * The bridge host can reach the same WiFi network as the device.
 * The Reticulum destination hash is either empty for plain broadcast or matches a reachable Reticulum destination with a known path.
 * The bridge is replying to UDP requests. The firmware now waits for a bridge acknowledgement before reporting the Reticulum bridge path as ready.
+* The config portal runtime status panel does not show a persistent bridge mode of `error` with a useful last-error string.
 
-The bundled bridge uses the Python Reticulum stack on a host machine. A full native Reticulum implementation on the ESP target is still pending.
+The bundled bridge uses the Python Reticulum stack on a host machine. Directed delivery now retries with exponential backoff before failing, and you can tune the retry behavior on the bridge process with `--delivery-attempts`, `--delivery-backoff-seconds`, `--delivery-backoff-factor`, and `--delivery-backoff-max`. A full native Reticulum implementation on the ESP target is still pending.
 
 ## Power And Stability
 

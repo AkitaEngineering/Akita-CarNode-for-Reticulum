@@ -39,6 +39,10 @@ class AkitaReticulumBridge:
         aspects: list[str],
         default_destination: str,
         path_timeout: float,
+        delivery_attempts: int,
+        delivery_backoff_seconds: float,
+        delivery_backoff_factor: float,
+        delivery_backoff_max: float,
     ):
         self.rns = rns
         self.reticulum = rns.Reticulum(config_path)
@@ -46,6 +50,10 @@ class AkitaReticulumBridge:
         self.aspects = aspects
         self.default_destination = default_destination.strip().lower()
         self.path_timeout = max(0.0, path_timeout)
+        self.delivery_attempts = max(1, delivery_attempts)
+        self.delivery_backoff_seconds = max(0.0, delivery_backoff_seconds)
+        self.delivery_backoff_factor = max(1.0, delivery_backoff_factor)
+        self.delivery_backoff_max = max(self.delivery_backoff_seconds, delivery_backoff_max)
         self.destination_hex_length = (rns.Reticulum.TRUNCATED_HASHLENGTH // 8) * 2
         self.broadcast_destination = rns.Destination(
             None,
@@ -111,6 +119,35 @@ class AkitaReticulumBridge:
     def payload_bytes(self, payload_value) -> bytes:
         return json.dumps(payload_value, separators=(",", ":")).encode("utf-8")
 
+    def deliver_directed(self, destination_hash: str, payload: bytes):
+        backoff = self.delivery_backoff_seconds
+        last_error = None
+
+        for attempt in range(1, self.delivery_attempts + 1):
+            try:
+                destination = self.resolve_outbound_destination(destination_hash)
+                receipt = self.rns.Packet(destination, payload).send()
+                if receipt is None:
+                    raise RuntimeError("Packet send did not return a receipt")
+                return destination, attempt
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.delivery_attempts:
+                    break
+
+                self.log(
+                    f"Directed delivery attempt {attempt}/{self.delivery_attempts} failed for {destination_hash}: {exc}. Retrying in {backoff:.2f} seconds",
+                    self.rns.LOG_INFO,
+                )
+                self.rns.Transport.request_path(bytes.fromhex(destination_hash))
+                if backoff > 0:
+                    time.sleep(backoff)
+                backoff = min(self.delivery_backoff_max, backoff * self.delivery_backoff_factor)
+
+        raise RuntimeError(
+            f"Directed delivery failed after {self.delivery_attempts} attempts: {last_error}"
+        )
+
     def bridge_response(self, status: str, request: str, sequence=None, **fields) -> dict:
         response = {
             "bridge": BRIDGE_PROTOCOL,
@@ -149,8 +186,7 @@ class AkitaReticulumBridge:
         payload = self.payload_bytes(envelope.get("payload"))
 
         if destination_hash:
-            destination = self.resolve_outbound_destination(destination_hash)
-            self.rns.Packet(destination, payload).send()
+            destination, attempts = self.deliver_directed(destination_hash, payload)
             self.log(
                 f"Forwarded {len(payload)} bytes to {self.rns.prettyhexrep(destination.hash)}",
                 self.rns.LOG_INFO,
@@ -162,6 +198,7 @@ class AkitaReticulumBridge:
                 mode="directed",
                 destination=destination.hexhash,
                 bytes=len(payload),
+                attempts=attempts,
             )
 
         self.rns.Packet(self.broadcast_destination, payload).send()
@@ -213,6 +250,30 @@ def main() -> int:
         default=5.0,
         help="Seconds to wait after requesting a missing Reticulum path",
     )
+    parser.add_argument(
+        "--delivery-attempts",
+        type=int,
+        default=3,
+        help="Total directed delivery attempts before returning an error",
+    )
+    parser.add_argument(
+        "--delivery-backoff-seconds",
+        type=float,
+        default=0.5,
+        help="Initial backoff in seconds between directed delivery retries",
+    )
+    parser.add_argument(
+        "--delivery-backoff-factor",
+        type=float,
+        default=2.0,
+        help="Multiplier applied to the directed delivery retry backoff",
+    )
+    parser.add_argument(
+        "--delivery-backoff-max",
+        type=float,
+        default=4.0,
+        help="Maximum backoff in seconds between directed delivery retries",
+    )
     args = parser.parse_args()
 
     try:
@@ -228,6 +289,10 @@ def main() -> int:
         aspects=args.aspects,
         default_destination=args.default_destination,
         path_timeout=args.path_timeout,
+        delivery_attempts=args.delivery_attempts,
+        delivery_backoff_seconds=args.delivery_backoff_seconds,
+        delivery_backoff_factor=args.delivery_backoff_factor,
+        delivery_backoff_max=args.delivery_backoff_max,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
