@@ -1,0 +1,32 @@
+menu "Akita CarNode"
+
+choice AKITA_BOARD_PROFILE
+    prompt "Primary board profile"
+    default AKITA_BOARD_GENERIC_ESP32S3
+
+    config AKITA_BOARD_GENERIC_ESP32S3
+        bool "Generic ESP32-S3"
+
+    config AKITA_BOARD_GENERIC_ESP32C6
+        bool "Generic ESP32-C6"
+
+    config AKITA_BOARD_GENERIC_ESP32C5
+        bool "Generic ESP32-C5"
+
+    config AKITA_BOARD_HELTEC_LORA32_V2
+        bool "Heltec LoRa 32 V2"
+endchoice
+
+config AKITA_ENABLE_CONFIG_PORTAL
+    bool "Enable built-in config portal"
+    default y
+
+config AKITA_CONFIG_PORTAL_SSID
+    string "Config portal SSID"
+    default "Akita-CarNode-Setup"
+
+config AKITA_CONFIG_PORTAL_PASSWORD
+    string "Config portal password"
+    default ""
+
+endmenu

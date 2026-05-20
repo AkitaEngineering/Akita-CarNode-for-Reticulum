@@ -1,73 +1,78 @@
-# Akita CarNode - Hardware Setup Guide
+# Native Hardware Setup Guide
 
-This guide details the hardware components and connections required for the Akita CarNode project.
+This guide covers the active ESP-IDF-native firmware path.
 
 ## Required Components
 
-1.  **ESP32 Development Board:**
-    * Any standard ESP32 board (e.g., ESP32-DevKitC, ESP32-WROOM-32 based boards).
-    * **For LoRa:** An ESP32 board with an integrated LoRa chip is required (e.g., Heltec WiFi LoRa 32 series, TTGO LoRa32 series). Ensure the LoRa chip is supported by the "LoRa by Sandeep Mistry" library (typically Semtech SX1276/SX1278).
-2.  **Bluetooth Low Energy (BLE) OBD-II Adapter:**
-    * Must be a **BLE (Bluetooth 4.0+)** type, not a classic Bluetooth adapter.
-    * Generic ELM327-compatible BLE adapters are common.
-3.  **GPS Module:**
-    * NMEA-compatible serial GPS module.
-    * Commonly used modules: u-blox NEO-6M, NEO-7M, NEO-M8N.
-    * Ensure the module has a UART (TX/RX) interface.
-    * An active or passive GPS antenna appropriate for the module.
-4.  **LoRa Antenna (If using LoRa):**
-    * An antenna specifically designed for the LoRa frequency band configured in `config.h` (e.g., 433MHz, 868MHz, 915MHz).
-    * Must have the correct connector for your ESP32 LoRa board (e.g., SMA, U.FL/IPEX).
-5.  **Power Supply:**
-    * A stable 5V DC power source capable of providing at least 1A (ESP32 with peripherals can draw significant current, especially during WiFi/BLE transmission).
-    * **Options:**
-        * USB Power Bank (for testing).
-        * Vehicle 12V/24V to 5V DC-DC Buck Converter: Recommended for in-vehicle installation. Connect this to an **ignition-switched power source** in your vehicle to prevent draining the car battery when the vehicle is off.
-6.  **Wiring & Connectors:**
-    * Jumper wires (Dupont cables) for prototyping.
-    * Breadboard (optional, for initial testing).
-    * Soldering equipment if creating a more permanent setup.
-7.  **(Optional) Status LED:**
-    * One standard LED (any color).
-    * One current-limiting resistor (typically 220 Ohm to 330 Ohm for a 3.3V GPIO pin).
+1. **ESP32 board**
+   * Generic ESP32-S3, ESP32-C6, or ESP32-C5 board, or
+   * Heltec LoRa 32 V2 for the built-in LoRa profile
+2. **BLE OBD-II adapter**
+   * BLE only, not classic Bluetooth
+3. **GPS module**
+   * UART/NMEA compatible module such as NEO-6M, NEO-7M, or NEO-M8N
+4. **LoRa antenna**
+   * Required if you are bringing up a LoRa-capable board
+5. **Stable 5V supply**
+   * Vehicle buck converter recommended for in-car installs
 
+## Wiring Model
 
-### 1. ESP32 Power:
-* Connect your 5V power supply to the ESP32's 5V/VIN pin and GND to an ESP32 GND pin.
+### GPS
 
-### 2. GPS Module to ESP32:
-* **GPS VCC** -> ESP32 **3.3V** (Most NEO-6M modules can run on 3.3V; some might require/tolerate 5V. **Check your GPS module's datasheet!**)
-* **GPS GND** -> ESP32 **GND**
-* **GPS TX Output** -> ESP32 **`GPS_RX_PIN`** (As defined in `config.h`, e.g., GPIO34)
-* **GPS RX Input** -> ESP32 **`GPS_TX_PIN`** (As defined in `config.h`, e.g., GPIO12. This is often not strictly necessary if you are only reading data from the GPS and not sending configuration commands to it.)
-    * **Note on Logic Levels:** Ensure your GPS module's UART signals are 3.3V compatible with the ESP32. Most modern modules are. If you have a 5V UART GPS, a logic level shifter would be needed for the GPS TX to ESP32 RX line.
+The native firmware uses runtime-configured UART pins rather than a fixed Arduino header.
 
-### 3. LoRa Module (If using an ESP32 LoRa Board):
-* The LoRa chip is typically pre-wired on these boards.
-* **Crucially, ensure the LoRa pin definitions in `config.h` (`LORA_SCK_PIN`, `LORA_MISO_PIN`, `LORA_MOSI_PIN`, `LORA_SS_PIN`, `LORA_RST_PIN`, `LORA_DI0_PIN`) exactly match the schematic of your specific ESP32 LoRa board model and version.** These can vary significantly (e.g., Heltec V1 vs V2 vs V3).
-* Connect the LoRa antenna securely to the board's LoRa antenna connector. **Never operate the LoRa module at high power without an antenna connected, as it can damage the chip.**
+Wire the GPS module as follows:
 
-### 4. BLE OBD-II Adapter:
-* This is a wireless connection. No physical wiring to the ESP32 is needed for BLE.
-* Plug the OBD-II adapter into your vehicle's OBD-II diagnostic port.
-* The vehicle's ignition may need to be in the "ON" or "Accessory" position for the OBD-II port (and thus the adapter) to be powered.
+* GPS VCC -> board 3.3V or 5V as required by the module
+* GPS GND -> board GND
+* GPS TX -> configured GPS RX pin
+* GPS RX -> configured GPS TX pin
 
-### 5. (Optional) Status LED to ESP32:
-* LED Anode (longer leg) -> Current-limiting Resistor (e.g., 220 Ohm)
-* Other end of Resistor -> ESP32 **`STATUS_LED_PIN`** (As defined in `config.h`, e.g., GPIO2)
-* LED Cathode (shorter leg, flat side) -> ESP32 **GND**
+Set the final RX, TX, and baud values in the config portal after boot.
 
-## Assembly Steps & Considerations:
+### BLE OBD-II
 
-1.  **Prototyping:** It's highly recommended to first assemble and test the system on a breadboard (where applicable) or with reliable jumper wire connections before any permanent installation.
-2.  **Soldering (Permanent Setup):** For a durable in-vehicle installation, solder connections to a perfboard or a custom PCB. Use appropriate strain relief for wires.
-3.  **Enclosure:** Consider a 3D-printed or off-the-shelf enclosure to protect the electronics from dust, moisture (if applicable), and physical damage. Ensure adequate ventilation if the ESP32 runs warm.
-4.  **GPS Antenna Placement:** For best GPS reception, the antenna needs a clear view of the sky. Place it on the dashboard, rear parcel shelf, or externally (if using a weatherproof external antenna). Avoid metallic obstructions.
-5.  **LoRa Antenna Placement (if used):** Position for optimal range. Avoid placing it directly against large metal surfaces. Vertical orientation is often best.
-6.  **Power Stability:** Ensure your chosen power supply is stable and can handle current spikes from the ESP32 (especially during WiFi/BLE transmissions). Poor power can lead to instability and resets.
-7.  **Vehicle Integration:**
-    * Securely mount the CarNode unit in the vehicle.
-    * Route power cables safely, avoiding interference with vehicle operation or airbags.
-    * If using an external 12V-to-5V converter, ensure it's fused appropriately on the 12V side.
+The OBD adapter remains wireless.
 
-By following these hardware setup guidelines, you should be able to establish the necessary physical connections for the Akita CarNode. Always double-check pinouts for your specific ESP32 board and peripherals from their datasheets or schematics.
+* Plug the adapter into the vehicle OBD-II port.
+* Ensure the vehicle ignition state powers the adapter.
+
+### LoRa
+
+The native LoRa backend is not finished yet, but wiring can still be prepared.
+
+For Heltec LoRa 32 V2, the current board profile seeds these defaults:
+
+* SCK -> GPIO5
+* MISO -> GPIO19
+* MOSI -> GPIO27
+* CS -> GPIO18
+* RESET -> GPIO14
+* DIO0 -> GPIO26
+* LED -> GPIO25
+
+Always verify the actual board revision before trusting defaults.
+
+### Status LED
+
+If your board does not expose a built-in LED or uses a different LED pin, change the pin in runtime configuration or adjust the board profile.
+
+## Board Profile Notes
+
+### Generic ESP32-S3 / ESP32-C6 / ESP32-C5
+
+These profiles are intentionally conservative. Expect to set UART pins and any external LED or LoRa wiring yourself during bring-up.
+
+### Heltec LoRa 32 V2
+
+This profile seeds known LoRa and LED defaults, making it the quickest target for LoRa-oriented bring-up once the native radio backend lands.
+
+## Bring-Up Recommendations
+
+1. Power the board from a stable bench supply or good USB source first.
+2. Boot with the config portal enabled.
+3. Set GPS pins and baud through the portal.
+4. Confirm GPS output in the serial log.
+5. Add BLE OBD validation after the native GATT client is completed.
+6. Add LoRa validation after the native radio backend is completed.

@@ -245,4 +245,3 @@ void loop() {
     delay(1); // Use with caution. Prefer fully non-blocking code.
               // If issues arise, this can be increased slightly, but investigate root cause.
 }
-
