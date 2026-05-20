@@ -91,6 +91,7 @@ Check the following:
 * The telemetry endpoint is `rns+udp://host:port` and points to the machine running `tools/akita_reticulum_bridge.py`.
 * The bridge host can reach the same WiFi network as the device.
 * The Reticulum destination hash is either empty for plain broadcast or matches a reachable Reticulum destination with a known path.
+* The bridge is replying to UDP requests. The firmware now waits for a bridge acknowledgement before reporting the Reticulum bridge path as ready.
 
 The bundled bridge uses the Python Reticulum stack on a host machine. A full native Reticulum implementation on the ESP target is still pending.
 

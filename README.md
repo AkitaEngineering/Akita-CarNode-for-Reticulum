@@ -139,6 +139,8 @@ python3 tools/akita_reticulum_bridge.py --listen-port 4242 --config ~/.reticulum
 
 The firmware will forward telemetry to that UDP bridge, and the bridge will inject it into Reticulum either as a directed packet to the configured destination hash or as a plain broadcast when the destination field is empty.
 
+The bridge now answers `ping` and `telemetry` requests with structured acknowledgements. For `rns+udp://` endpoints, the firmware only reports the transport as ready after the bridge has acknowledged a request, so bridge reachability is no longer inferred from WiFi link state alone.
+
 ## Design Direction
 
 This refactor is intentionally pushing the repository toward a thinner, more predictable firmware base:

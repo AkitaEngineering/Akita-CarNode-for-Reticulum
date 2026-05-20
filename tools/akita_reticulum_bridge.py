@@ -9,6 +9,10 @@ import time
 from pathlib import Path
 
 
+BRIDGE_PROTOCOL = "akita-rns-udp-v2"
+SUPPORTED_BRIDGE_PROTOCOLS = {"akita-rns-udp-v1", BRIDGE_PROTOCOL}
+
+
 def load_rns(reticulum_path: str | None):
     if reticulum_path:
         sys.path.insert(0, reticulum_path)
@@ -107,9 +111,37 @@ class AkitaReticulumBridge:
     def payload_bytes(self, payload_value) -> bytes:
         return json.dumps(payload_value, separators=(",", ":")).encode("utf-8")
 
-    def publish_envelope(self, envelope: dict):
-        if envelope.get("bridge") != "akita-rns-udp-v1":
+    def bridge_response(self, status: str, request: str, sequence=None, **fields) -> dict:
+        response = {
+            "bridge": BRIDGE_PROTOCOL,
+            "status": status,
+            "request": request,
+        }
+        if sequence is not None:
+            response["sequence"] = sequence
+        response.update(fields)
+        return response
+
+    def handle_envelope(self, envelope: dict) -> dict:
+        bridge_protocol = str(envelope.get("bridge", "") or "")
+        request = str(envelope.get("kind", "telemetry") or "telemetry")
+        sequence = envelope.get("sequence")
+
+        if bridge_protocol not in SUPPORTED_BRIDGE_PROTOCOLS:
             raise ValueError("Unsupported bridge envelope")
+
+        if request == "ping":
+            return self.bridge_response(
+                "ok",
+                request,
+                sequence=sequence,
+                mode="bridge_ready",
+                app_name=self.app_name,
+                aspects=self.aspects,
+            )
+
+        if request != "telemetry":
+            raise ValueError(f"Unsupported bridge request type: {request}")
 
         destination_hash = self.validate_destination(
             str(envelope.get("destination", self.default_destination) or self.default_destination)
@@ -123,12 +155,27 @@ class AkitaReticulumBridge:
                 f"Forwarded {len(payload)} bytes to {self.rns.prettyhexrep(destination.hash)}",
                 self.rns.LOG_INFO,
             )
-            return
+            return self.bridge_response(
+                "ok",
+                request,
+                sequence=sequence,
+                mode="directed",
+                destination=destination.hexhash,
+                bytes=len(payload),
+            )
 
         self.rns.Packet(self.broadcast_destination, payload).send()
         self.log(
             f"Broadcast {len(payload)} bytes on {self.rns.prettyhexrep(self.broadcast_destination.hash)}",
             self.rns.LOG_INFO,
+        )
+        return self.bridge_response(
+            "ok",
+            request,
+            sequence=sequence,
+            mode="broadcast",
+            destination=self.broadcast_destination.hexhash,
+            bytes=len(payload),
         )
 
 
@@ -198,16 +245,38 @@ def main() -> int:
     )
 
     while True:
+        address = None
+        envelope = None
         try:
             data, address = sock.recvfrom(4096)
             envelope = json.loads(data.decode("utf-8"))
-            bridge.publish_envelope(envelope)
+            response = bridge.handle_envelope(envelope)
+            sock.sendto(json.dumps(response, separators=(",", ":")).encode("utf-8"), address)
         except KeyboardInterrupt:
             print("")
             return 0
         except Exception as exc:
+            source = "unknown peer"
+            if address is not None:
+                source = f"{address[0]}:{address[1]}"
+
+            if address is not None:
+                request = "unknown"
+                sequence = None
+                if isinstance(envelope, dict):
+                    request = str(envelope.get("kind", request) or request)
+                    sequence = envelope.get("sequence")
+
+                error_response = bridge.bridge_response(
+                    "error",
+                    request,
+                    sequence=sequence,
+                    message=str(exc),
+                )
+                sock.sendto(json.dumps(error_response, separators=(",", ":")).encode("utf-8"), address)
+
             bridge.log(
-                f"Bridge receive from {address[0]}:{address[1]} failed: {exc}",
+                f"Bridge receive from {source} failed: {exc}",
                 bridge.rns.LOG_ERROR,
             )
 
