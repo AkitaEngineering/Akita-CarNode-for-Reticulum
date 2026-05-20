@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 static const char *TAG = "akita_app";
 static akita_runtime_config_t g_runtime_config;

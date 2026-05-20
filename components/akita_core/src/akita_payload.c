@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "akita_board.h"
 #include "esp_timer.h"
 
 static size_t akita_append_text(char *buffer, size_t buffer_size, size_t used, const char *text) {
