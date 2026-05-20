@@ -56,7 +56,7 @@ static const char kConfigPage[] =
 "    <div class=\"hero\">\n"
 "      <div class=\"eyebrow\">Akita native ESP-IDF firmware</div>\n"
 "      <h1>CarNode control surface</h1>\n"
-"      <p class=\"lead\">Use this page to set board identity, telemetry cadence, GPS, OBD and uplink defaults without any Arduino dependency. OBD and transport changes are applied live after save; GPS and UART changes still require a reboot.</p>\n"
+"      <p class=\"lead\">Use this page to set board identity, telemetry cadence, GPS, OBD and uplink defaults without any Arduino dependency. Runtime configuration is saved to NVS and reapplied live after save.</p>\n"
 "    </div>\n"
 "    <form id=\"config-form\">\n"
 "      <div class=\"grid\">\n"
@@ -340,7 +340,7 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
 
     httpd_resp_set_type(request, "text/plain");
     if (apply_err == ESP_OK) {
-        return httpd_resp_sendstr(request, "Saved. OBD and transport changes were applied live. Reboot only for GPS and UART changes.");
+        return httpd_resp_sendstr(request, "Saved. Runtime changes were applied live.");
     }
 
     snprintf(response, sizeof(response),

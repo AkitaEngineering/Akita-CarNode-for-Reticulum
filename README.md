@@ -91,7 +91,7 @@ The local workspace copy of `Reticulum/` is the Python implementation and protoc
 3. Open `menuconfig` and choose the board profile under `Akita CarNode`.
 4. Build and flash the firmware.
 5. Connect to the configuration AP and open the built-in configuration UI.
-6. Save runtime settings, confirm live OBD and transport reapply, and reboot only if you changed GPS or UART settings.
+6. Save runtime settings and confirm the live runtime reapply in the serial log.
 
 Typical command flow:
 

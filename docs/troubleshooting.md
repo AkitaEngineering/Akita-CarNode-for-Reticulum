@@ -43,6 +43,7 @@ Check the following:
 * The GPS baud matches the module.
 * The GPS antenna has a clear sky view.
 * The selected board profile is not applying invalid defaults for your wiring.
+* The live-apply response in the portal did not report a runtime apply failure.
 
 The native GPS component is active now, so GPS issues are usually pin, baud, wiring, or antenna issues.
 

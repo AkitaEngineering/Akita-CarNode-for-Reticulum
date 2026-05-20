@@ -8,14 +8,51 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "akita_gps";
 static bool g_gps_ready;
+static bool g_uart_driver_ready;
 static uart_port_t g_uart_port;
 static char g_sentence[128];
 static size_t g_sentence_len;
 static akita_gps_snapshot_t g_latest_fix;
 static uint64_t g_last_fix_ms;
+static SemaphoreHandle_t g_gps_lock;
+
+static esp_err_t akita_gps_ensure_lock(void) {
+    if (g_gps_lock == NULL) {
+        g_gps_lock = xSemaphoreCreateMutex();
+        if (g_gps_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void akita_gps_reset_parser_state(void) {
+    memset(&g_latest_fix, 0, sizeof(g_latest_fix));
+    memset(g_sentence, 0, sizeof(g_sentence));
+    g_sentence_len = 0;
+    g_last_fix_ms = 0;
+}
+
+static void akita_gps_stop_locked(void) {
+    esp_err_t err;
+
+    g_gps_ready = false;
+    if (g_uart_driver_ready) {
+        err = uart_driver_delete(g_uart_port);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "GPS UART driver delete returned %s", esp_err_to_name(err));
+        }
+        g_uart_driver_ready = false;
+    }
+
+    akita_gps_reset_parser_state();
+}
 
 static float akita_nmea_to_decimal(const char *text, char hemisphere) {
     double raw = atof(text);
@@ -101,13 +138,22 @@ static void akita_gps_process_sentence(char *sentence) {
 
 esp_err_t akita_gps_init(const akita_runtime_config_t *config) {
     uart_config_t uart_config;
+    esp_err_t err;
 
     if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    err = akita_gps_ensure_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    xSemaphoreTake(g_gps_lock, portMAX_DELAY);
+    akita_gps_stop_locked();
+
     if (!config->enable_gps || config->gps_rx_pin < 0 || config->gps_tx_pin < 0) {
-        g_gps_ready = false;
+        xSemaphoreGive(g_gps_lock);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -120,11 +166,27 @@ esp_err_t akita_gps_init(const akita_runtime_config_t *config) {
     uart_config.rx_flow_ctrl_thresh = 0;
     uart_config.source_clk = UART_SCLK_DEFAULT;
 
-    ESP_ERROR_CHECK(uart_driver_install(g_uart_port, 2048, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(g_uart_port, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(g_uart_port, config->gps_tx_pin, config->gps_rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    err = uart_driver_install(g_uart_port, 2048, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        xSemaphoreGive(g_gps_lock);
+        return err;
+    }
+
+    g_uart_driver_ready = true;
+    err = uart_param_config(g_uart_port, &uart_config);
+    if (err == ESP_OK) {
+        err = uart_set_pin(g_uart_port, config->gps_tx_pin, config->gps_rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    }
+
+    if (err != ESP_OK) {
+        akita_gps_stop_locked();
+        xSemaphoreGive(g_gps_lock);
+        return err;
+    }
+
     g_gps_ready = true;
     ESP_LOGI(TAG, "GPS UART ready on port %ld RX=%ld TX=%ld", (long) config->gps_uart_port, (long) config->gps_rx_pin, (long) config->gps_tx_pin);
+    xSemaphoreGive(g_gps_lock);
     return ESP_OK;
 }
 
@@ -133,13 +195,23 @@ void akita_gps_poll(akita_gps_snapshot_t *snapshot) {
     int bytes_read;
     int index;
     uint64_t now_ms;
+    esp_err_t err;
 
     if (snapshot == NULL) {
         return;
     }
 
+    err = akita_gps_ensure_lock();
+    if (err != ESP_OK) {
+        memset(snapshot, 0, sizeof(*snapshot));
+        return;
+    }
+
+    xSemaphoreTake(g_gps_lock, portMAX_DELAY);
+
     if (!g_gps_ready) {
-        snapshot->fix = false;
+        memset(snapshot, 0, sizeof(*snapshot));
+        xSemaphoreGive(g_gps_lock);
         return;
     }
 
@@ -163,4 +235,5 @@ void akita_gps_poll(akita_gps_snapshot_t *snapshot) {
     }
 
     *snapshot = g_latest_fix;
+    xSemaphoreGive(g_gps_lock);
 }

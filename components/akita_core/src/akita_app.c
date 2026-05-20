@@ -23,23 +23,29 @@ static bool g_led_ready;
 
 static esp_err_t akita_apply_runtime_config(const akita_runtime_config_t *config, void *context) {
     esp_err_t err;
+    esp_err_t result = ESP_OK;
 
     (void) context;
     if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    err = akita_gps_init(config);
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED && result == ESP_OK) {
+        result = err;
+    }
+
     err = akita_obd_init(config);
-    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
-        return err;
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED && result == ESP_OK) {
+        result = err;
     }
 
     err = akita_transport_init(config);
-    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
-        return err;
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED && result == ESP_OK) {
+        result = err;
     }
 
-    return ESP_OK;
+    return result;
 }
 
 static void akita_status_led_init(void) {
