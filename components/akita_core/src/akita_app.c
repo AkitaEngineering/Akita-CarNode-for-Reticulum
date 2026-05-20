@@ -21,6 +21,27 @@ static akita_runtime_config_t g_runtime_config;
 static akita_vehicle_telemetry_t g_telemetry;
 static bool g_led_ready;
 
+static esp_err_t akita_apply_runtime_config(const akita_runtime_config_t *config, void *context) {
+    esp_err_t err;
+
+    (void) context;
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = akita_obd_init(config);
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+        return err;
+    }
+
+    err = akita_transport_init(config);
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+        return err;
+    }
+
+    return ESP_OK;
+}
+
 static void akita_status_led_init(void) {
     if (g_runtime_config.status_led_pin < 0) {
         g_led_ready = false;
@@ -103,6 +124,7 @@ esp_err_t akita_app_start(void) {
     akita_status_led_init();
 
     if (g_runtime_config.enable_config_ap) {
+        akita_config_ui_set_apply_callback(akita_apply_runtime_config, NULL);
         err = akita_config_ui_start(&g_runtime_config);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Config UI start failed: %s", esp_err_to_name(err));

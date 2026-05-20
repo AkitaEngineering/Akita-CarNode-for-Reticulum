@@ -47,7 +47,7 @@ Current runtime fields:
 3. Join the WiFi AP configured in `menuconfig`.
 4. Open `http://192.168.4.1/`.
 5. Edit settings and save.
-6. Reboot the node so UART and transport changes are applied cleanly.
+6. OBD and transport changes apply immediately after save. Reboot only if you changed GPS or UART settings.
 
 ## Recommended Bring-Up Order
 
@@ -56,7 +56,7 @@ Current runtime fields:
 3. Boot with the config portal enabled.
 4. Set GPS pins and telemetry cadence.
 5. Confirm GPS lock and payload generation in the serial log.
-6. Set the OBD adapter name and WiFi telemetry endpoint, then reboot for a clean reapply.
+6. Set the OBD adapter name and WiFi telemetry endpoint, save, and confirm the live reapply in the serial log.
 
 ## Notes
 

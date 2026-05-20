@@ -19,6 +19,8 @@ static httpd_handle_t g_httpd_handle;
 static akita_runtime_config_t *g_runtime_config;
 static bool g_wifi_started;
 static bool g_http_running;
+static akita_config_apply_callback_t g_apply_callback;
+static void *g_apply_callback_context;
 
 static const char kConfigPage[] =
 "<!doctype html>\n"
@@ -54,7 +56,7 @@ static const char kConfigPage[] =
 "    <div class=\"hero\">\n"
 "      <div class=\"eyebrow\">Akita native ESP-IDF firmware</div>\n"
 "      <h1>CarNode control surface</h1>\n"
-"      <p class=\"lead\">Use this page to set board identity, telemetry cadence, GPS, OBD and uplink defaults without any Arduino dependency. Configuration is saved to NVS and takes effect on the next boot.</p>\n"
+"      <p class=\"lead\">Use this page to set board identity, telemetry cadence, GPS, OBD and uplink defaults without any Arduino dependency. OBD and transport changes are applied live after save; GPS and UART changes still require a reboot.</p>\n"
 "    </div>\n"
 "    <form id=\"config-form\">\n"
 "      <div class=\"grid\">\n"
@@ -270,6 +272,8 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
 static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     char body[1024];
     char scratch[128];
+    char response[160];
+    esp_err_t apply_err = ESP_OK;
     int received;
 
     if (request->content_len >= (int) sizeof(body)) {
@@ -330,8 +334,19 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     g_runtime_config->use_obd_uuid = akita_form_contains(body, "use_obd_uuid");
     ESP_ERROR_CHECK(akita_config_save(g_runtime_config));
 
+    if (g_apply_callback != NULL) {
+        apply_err = g_apply_callback(g_runtime_config, g_apply_callback_context);
+    }
+
     httpd_resp_set_type(request, "text/plain");
-    return httpd_resp_sendstr(request, "Saved. Reboot the node to apply transport and UART changes.");
+    if (apply_err == ESP_OK) {
+        return httpd_resp_sendstr(request, "Saved. OBD and transport changes were applied live. Reboot only for GPS and UART changes.");
+    }
+
+    snprintf(response, sizeof(response),
+             "Saved, but live apply failed: %s. Reboot the node to fully apply changes.",
+             esp_err_to_name(apply_err));
+    return httpd_resp_sendstr(request, response);
 }
 
 static esp_err_t akita_config_ui_start_wifi(const akita_runtime_config_t *config) {
@@ -412,6 +427,11 @@ esp_err_t akita_config_ui_start(akita_runtime_config_t *config) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_post_uri));
     g_http_running = true;
     return ESP_OK;
+}
+
+void akita_config_ui_set_apply_callback(akita_config_apply_callback_t callback, void *context) {
+    g_apply_callback = callback;
+    g_apply_callback_context = context;
 }
 
 bool akita_config_ui_is_running(void) {

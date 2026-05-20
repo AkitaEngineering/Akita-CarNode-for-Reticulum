@@ -117,6 +117,24 @@ static void akita_clear_response_buffer(void) {
     g_rx_buffer[0] = '\0';
 }
 
+static void akita_obd_stop_link_activity(void) {
+    int rc;
+
+    if (g_scan_active) {
+        rc = ble_gap_disc_cancel();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "BLE scan cancel returned %d during config reapply", rc);
+        }
+    }
+
+    if (g_conn_handle != AKITA_OBD_CONN_HANDLE_NONE) {
+        rc = ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "BLE disconnect returned %d during config reapply", rc);
+        }
+    }
+}
+
 static void akita_reset_link_state(void) {
     g_scan_active = false;
     g_connecting = false;
@@ -925,13 +943,19 @@ static uint8_t akita_hex_u8(const char *text) {
 }
 
 esp_err_t akita_obd_init(const akita_runtime_config_t *config) {
+    bool host_synced;
+
     memset(&g_obd_state, 0, sizeof(g_obd_state));
     if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    host_synced = g_host_synced;
+    if (g_stack_started) {
+        akita_obd_stop_link_activity();
+    }
+
     memcpy(&g_config, config, sizeof(g_config));
-    g_host_synced = false;
     akita_reset_link_state();
     akita_copy_normalized_uuid(g_config.obd_service_uuid, g_target_service_uuid, sizeof(g_target_service_uuid));
     akita_copy_normalized_uuid(g_config.obd_characteristic_uuid, g_target_characteristic_uuid,
@@ -948,7 +972,8 @@ esp_err_t akita_obd_init(const akita_runtime_config_t *config) {
         ble_hs_cfg.sync_cb = akita_on_sync;
         nimble_port_freertos_init(akita_obd_host_task);
         g_stack_started = true;
-    } else if (g_host_synced) {
+    } else if (host_synced) {
+        g_host_synced = true;
         (void) akita_start_scan();
     }
 

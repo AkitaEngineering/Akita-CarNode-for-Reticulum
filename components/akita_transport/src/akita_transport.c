@@ -41,6 +41,22 @@ static void akita_transport_update_ready_state(void) {
     g_transport_ready = g_wifi_transport_enabled && g_wifi_connected && g_endpoint_type != AKITA_TRANSPORT_ENDPOINT_NONE;
 }
 
+static void akita_transport_disable_wifi_uplink(void) {
+    esp_err_t err;
+
+    g_wifi_transport_enabled = false;
+    g_wifi_connected = false;
+    if (g_wifi_event_group != NULL) {
+        xEventGroupClearBits(g_wifi_event_group, AKITA_TRANSPORT_WIFI_CONNECTED_BIT);
+    }
+    akita_transport_update_ready_state();
+
+    err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_MODE) {
+        ESP_LOGW(TAG, "WiFi uplink disconnect failed: %s", esp_err_to_name(err));
+    }
+}
+
 static akita_transport_endpoint_t akita_transport_endpoint_type(const char *endpoint) {
     if (endpoint == NULL || endpoint[0] == '\0') {
         return AKITA_TRANSPORT_ENDPOINT_NONE;
@@ -171,8 +187,7 @@ static esp_err_t akita_transport_configure_wifi(const akita_runtime_config_t *co
     }
 
     g_endpoint_type = akita_transport_endpoint_type(config->telemetry_endpoint);
-    g_wifi_transport_enabled = false;
-    akita_transport_update_ready_state();
+    akita_transport_disable_wifi_uplink();
 
     if (config->transport_mode != AKITA_TRANSPORT_WIFI) {
         return ESP_OK;
@@ -230,6 +245,13 @@ static esp_err_t akita_transport_configure_wifi(const akita_runtime_config_t *co
         err = esp_wifi_set_mode(target_mode);
         if (err != ESP_OK) {
             return err;
+        }
+    }
+
+    err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_MODE) {
+        if (err != ESP_ERR_WIFI_NOT_INIT) {
+            ESP_LOGW(TAG, "Existing WiFi uplink disconnect returned: %s", esp_err_to_name(err));
         }
     }
 
@@ -384,25 +406,22 @@ esp_err_t akita_transport_init(const akita_runtime_config_t *config) {
     }
 
     if (config->transport_mode == AKITA_TRANSPORT_NONE) {
-        g_wifi_transport_enabled = false;
+        akita_transport_disable_wifi_uplink();
         g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_NONE;
-        akita_transport_update_ready_state();
         ESP_LOGI(TAG, "Transport disabled; telemetry will stay local");
         return ESP_OK;
     }
 
     if (config->transport_mode == AKITA_TRANSPORT_LORA) {
-        g_wifi_transport_enabled = false;
+        akita_transport_disable_wifi_uplink();
         g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_NONE;
-        akita_transport_update_ready_state();
         ESP_LOGW(TAG, "LoRa transport backend is not implemented yet");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     err = akita_transport_configure_wifi(config);
     if (err != ESP_OK) {
-        g_wifi_transport_enabled = false;
-        akita_transport_update_ready_state();
+        akita_transport_disable_wifi_uplink();
         return err;
     }
 
