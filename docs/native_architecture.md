@@ -54,9 +54,11 @@ Owns native OBD logic boundaries.
 
 Current responsibilities:
 
+* BLE scan and connection lifecycle
+* GATT service and characteristic discovery
+* command dispatch for common ELM327-style adapters
 * PID request formatting
 * PID response parsing for core telemetry fields
-* isolation point for the future BLE GATT client
 
 ### `akita_transport`
 
@@ -65,7 +67,10 @@ Owns the uplink boundary.
 Current responsibilities:
 
 * abstract transport mode selection
-* hold the place where native WiFi, LoRa, and Reticulum backends will land
+* WiFi station setup with AP+STA coexistence when the config portal is enabled
+* HTTP POST uplink for `http://` endpoints
+* UDP uplink for `udp://host:port` endpoints
+* landing point for future LoRa and native Reticulum backends
 
 ## Configuration Strategy
 
@@ -95,7 +100,7 @@ The Arduino code carried useful logic, but it also kept transport, board configu
 
 The next meaningful implementation steps are:
 
-1. Native BLE OBD GATT client for adapter discovery, command dispatch, and notifications.
-2. Native LoRa radio backend for supported boards.
-3. Native Reticulum transport integration on top of the new transport abstraction.
+1. Native LoRa radio backend for supported boards.
+2. Native Reticulum transport integration on top of the new transport abstraction.
+3. Runtime exposure for adapter-specific OBD UUID configuration in the config portal.
 4. Optional OTA and richer status endpoints once the transport path is stable.

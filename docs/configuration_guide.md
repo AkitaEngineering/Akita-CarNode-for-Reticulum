@@ -31,8 +31,9 @@ Current runtime fields:
 * vehicle ID
 * transport mode
 * WiFi SSID and password
-* native endpoint or destination placeholder
+* telemetry endpoint for `http://` or `udp://host:port`
 * OBD adapter name
+* optional OBD service UUID and characteristic UUID overrides
 * GPS RX pin
 * GPS TX pin
 * GPS UART baud
@@ -55,11 +56,13 @@ Current runtime fields:
 3. Boot with the config portal enabled.
 4. Set GPS pins and telemetry cadence.
 5. Confirm GPS lock and payload generation in the serial log.
-6. Finish the native BLE OBD and transport bring-up for your board.
+6. Set the OBD adapter name and WiFi telemetry endpoint, then reboot for a clean reapply.
 
 ## Notes
 
-* The transport component is a native abstraction layer, not a finished Reticulum backend yet.
-* The OBD component already owns request and PID parsing logic, but the BLE GATT client still needs to be completed.
+* The transport component now supports native WiFi uplink to `http://` and `udp://host:port` endpoints.
+* Native LoRa and native Reticulum backends are still pending.
+* The OBD component now uses a native BLE GATT client for common ELM327-style and Nordic UART style adapters.
+* For non-default adapters, the config portal can now store custom OBD service and characteristic UUID values.
 * The archived Arduino implementation remains under `legacy/arduino_reference/` only as migration reference.
 

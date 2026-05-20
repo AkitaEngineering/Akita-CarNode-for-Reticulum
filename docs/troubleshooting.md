@@ -46,11 +46,30 @@ Check the following:
 
 The native GPS component is active now, so GPS issues are usually pin, baud, wiring, or antenna issues.
 
-## Current Porting Gaps
+## Current Native Limits
 
-### OBD telemetry is not live yet
+### OBD telemetry does not update
 
-The native OBD component currently contains the request builder and PID response parser, but the BLE GATT client is still being ported. Until that is finished, OBD values will not update from a real adapter.
+Check the following:
+
+* The adapter is powered and advertising over BLE.
+* The configured OBD adapter name matches what the adapter actually advertises.
+* The adapter exposes a common ELM327-style serial BLE service or a Nordic UART style service.
+* If the adapter uses custom BLE UUIDs, the runtime OBD service and characteristic UUID fields are set in the config portal.
+* The node was rebooted after changing OBD or transport settings in the portal.
+
+The native OBD component now scans, connects, discovers GATT characteristics, and issues PID requests over BLE. For non-standard adapters, custom UUID configuration in the portal may be required, and some adapters can still need additional tuning beyond UUID overrides.
+
+### WiFi transport does not publish
+
+Check the following:
+
+* Transport mode is set to WiFi.
+* The WiFi SSID fits normal station limits and matches the target network.
+* The endpoint uses a currently supported scheme: `http://` or `udp://host:port`.
+* The node was rebooted after changing WiFi or endpoint settings.
+
+With the config portal enabled, the firmware runs the portal soft AP and the WiFi station uplink together.
 
 ### LoRa transport is not live yet
 

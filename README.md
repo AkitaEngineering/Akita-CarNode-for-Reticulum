@@ -4,9 +4,9 @@
 **License:** GPLv3  
 **Status:** ESP-IDF native refactor in progress
 
-This repository now uses a native ESP-IDF project layout instead of an Arduino sketch. The active firmware path is built around our own components, our own GPS parser, our own payload serializer, NVS-backed runtime configuration, and a built-in HTTP configuration portal.
+This repository now uses a native ESP-IDF project layout instead of an Arduino sketch. The active firmware path is built around our own components, our own GPS parser, our own payload serializer, a native BLE OBD client, NVS-backed runtime configuration, and a built-in HTTP configuration portal.
 
-The old Arduino code is no longer the project root or the primary build surface. It has been archived under `legacy/arduino_reference/` while the native BLE OBD, LoRa radio, and Reticulum backends continue to be ported.
+The old Arduino code is no longer the project root or the primary build surface. It has been archived under `legacy/arduino_reference/` while the native LoRa radio and Reticulum backends continue to be ported.
 
 ## What This Refactor Changes
 
@@ -36,13 +36,14 @@ Implemented now:
 * Board profiles and defaults
 * NVS-backed runtime configuration store
 * Built-in HTTP configuration UI on a soft AP
+* Native WiFi telemetry uplink for `http://` POST and `udp://host:port`
+* Native BLE OBD GATT client for common ELM327-style and Nordic UART style adapters
 * Custom UART-based GPS reader with lightweight NMEA parsing
 * Custom JSON payload formatter
 * Service orchestration and periodic telemetry loop
 
 Still being ported:
 
-* Native BLE OBD-II GATT client
 * Native LoRa radio backend
 * Native Reticulum transport/backend
 
@@ -117,8 +118,9 @@ The config portal starts a soft AP using the SSID from `menuconfig` and serves a
 * WiFi credentials
 * GPS UART pins and baud
 * OBD adapter name
+* Optional OBD service and characteristic UUID overrides
 * Telemetry cadence
-* Native endpoint/destination placeholder
+* Telemetry endpoint for `http://` or `udp://` uplinks
 
 See `docs/configuration_guide.md` for the full flow.
 

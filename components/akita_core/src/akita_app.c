@@ -59,7 +59,9 @@ static void akita_main_task(void *arg) {
         g_telemetry.system.config_portal_ready = akita_config_ui_is_running();
         g_telemetry.system.transport_ready = akita_transport_ready();
         g_telemetry.system.free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-        g_telemetry.system.wifi_ready = g_telemetry.system.config_portal_ready;
+        g_telemetry.system.wifi_ready =
+            g_telemetry.system.config_portal_ready ||
+            (g_runtime_config.transport_mode == AKITA_TRANSPORT_WIFI && akita_transport_ready());
         g_telemetry.system.lora_ready = (g_runtime_config.transport_mode == AKITA_TRANSPORT_LORA);
         g_telemetry.system.wifi_rssi = 0;
 

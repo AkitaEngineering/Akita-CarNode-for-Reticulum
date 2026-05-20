@@ -74,6 +74,9 @@ static const char kConfigPage[] =
 "        <section class=\"panel\">\n"
 "          <h2>Vehicle I/O</h2>\n"
 "          <label>OBD adapter name<input name=\"obd_device_name\" maxlength=\"63\"></label>\n"
+"          <label class=\"checkbox\"><input type=\"checkbox\" name=\"use_obd_uuid\">Use service UUID during BLE scan</label>\n"
+"          <label>OBD service UUID<input name=\"obd_service_uuid\" maxlength=\"39\" placeholder=\"0000ffe0-0000-1000-8000-00805f9b34fb\"></label>\n"
+"          <label>OBD characteristic UUID<input name=\"obd_characteristic_uuid\" maxlength=\"39\" placeholder=\"0000ffe1-0000-1000-8000-00805f9b34fb\"></label>\n"
 "          <label>GPS UART RX pin<input name=\"gps_rx_pin\" type=\"number\"></label>\n"
 "          <label>GPS UART TX pin<input name=\"gps_tx_pin\" type=\"number\"></label>\n"
 "          <label>GPS baud<input name=\"gps_uart_baud\" type=\"number\" min=\"1200\" max=\"921600\"></label>\n"
@@ -224,18 +227,23 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
     char wifi_ssid[96];
     char endpoint[128];
     char obd_name[96];
-    char response[768];
+    char obd_service_uuid[64];
+    char obd_characteristic_uuid[64];
+    char response[1024];
 
     akita_json_escape(g_runtime_config->vehicle_id, vehicle_id, sizeof(vehicle_id));
     akita_json_escape(g_runtime_config->wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     akita_json_escape(g_runtime_config->telemetry_endpoint, endpoint, sizeof(endpoint));
     akita_json_escape(g_runtime_config->obd_device_name, obd_name, sizeof(obd_name));
+    akita_json_escape(g_runtime_config->obd_service_uuid, obd_service_uuid, sizeof(obd_service_uuid));
+    akita_json_escape(g_runtime_config->obd_characteristic_uuid, obd_characteristic_uuid, sizeof(obd_characteristic_uuid));
 
     snprintf(
         response,
         sizeof(response),
         "{\"vehicle_id\":\"%s\",\"board_name\":\"%s\",\"transport_mode\":\"%s\","
         "\"wifi_ssid\":\"%s\",\"telemetry_endpoint\":\"%s\",\"obd_device_name\":\"%s\","
+        "\"use_obd_uuid\":%s,\"obd_service_uuid\":\"%s\",\"obd_characteristic_uuid\":\"%s\","
         "\"telemetry_interval_ms\":%lu,\"gps_rx_pin\":%ld,\"gps_tx_pin\":%ld,\"gps_uart_baud\":%lu,"
         "\"enable_gps\":%s}",
         vehicle_id,
@@ -245,6 +253,9 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
         wifi_ssid,
         endpoint,
         obd_name,
+        g_runtime_config->use_obd_uuid ? "true" : "false",
+        obd_service_uuid,
+        obd_characteristic_uuid,
         (unsigned long) g_runtime_config->telemetry_interval_ms,
         (long) g_runtime_config->gps_rx_pin,
         (long) g_runtime_config->gps_tx_pin,
@@ -287,6 +298,12 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     if (akita_form_get_value(body, "obd_device_name", scratch, sizeof(scratch))) {
         akita_copy_string(g_runtime_config->obd_device_name, sizeof(g_runtime_config->obd_device_name), scratch);
     }
+    if (akita_form_get_value(body, "obd_service_uuid", scratch, sizeof(scratch))) {
+        akita_copy_string(g_runtime_config->obd_service_uuid, sizeof(g_runtime_config->obd_service_uuid), scratch);
+    }
+    if (akita_form_get_value(body, "obd_characteristic_uuid", scratch, sizeof(scratch))) {
+        akita_copy_string(g_runtime_config->obd_characteristic_uuid, sizeof(g_runtime_config->obd_characteristic_uuid), scratch);
+    }
     if (akita_form_get_value(body, "telemetry_interval_ms", scratch, sizeof(scratch))) {
         g_runtime_config->telemetry_interval_ms = (uint32_t) strtoul(scratch, NULL, 10);
     }
@@ -310,6 +327,7 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     }
 
     g_runtime_config->enable_gps = akita_form_contains(body, "enable_gps");
+    g_runtime_config->use_obd_uuid = akita_form_contains(body, "use_obd_uuid");
     ESP_ERROR_CHECK(akita_config_save(g_runtime_config));
 
     httpd_resp_set_type(request, "text/plain");
