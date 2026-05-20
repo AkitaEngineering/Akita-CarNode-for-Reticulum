@@ -70,7 +70,9 @@ Current responsibilities:
 * WiFi station setup with AP+STA coexistence when the config portal is enabled
 * HTTP POST uplink for `http://` endpoints
 * UDP uplink for `udp://host:port` endpoints
-* landing point for future LoRa and native Reticulum backends
+* native SX127x LoRa transmit path for supported board profiles
+* Reticulum bridge envelopes for `rns+udp://host:port` endpoints
+* landing point for the remaining fully native Reticulum work
 
 ## Configuration Strategy
 
@@ -100,7 +102,6 @@ The Arduino code carried useful logic, but it also kept transport, board configu
 
 The next meaningful implementation steps are:
 
-1. Native LoRa radio backend for supported boards.
-2. Native Reticulum transport integration on top of the new transport abstraction.
-3. Runtime exposure for adapter-specific OBD UUID configuration in the config portal.
-4. Optional OTA and richer status endpoints once the transport path is stable.
+1. Full native Reticulum transport integration on top of the new transport abstraction.
+2. LoRa receive path and Reticulum-over-LoRa interface behavior.
+3. Optional OTA and richer status endpoints once the transport path is stable.

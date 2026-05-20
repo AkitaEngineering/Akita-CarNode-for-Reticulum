@@ -6,7 +6,7 @@
 
 This repository now uses a native ESP-IDF project layout instead of an Arduino sketch. The active firmware path is built around our own components, our own GPS parser, our own payload serializer, a native BLE OBD client, NVS-backed runtime configuration, and a built-in HTTP configuration portal.
 
-The old Arduino code is no longer the project root or the primary build surface. It has been archived under `legacy/arduino_reference/` while the native LoRa radio and Reticulum backends continue to be ported.
+The old Arduino code is no longer the project root or the primary build surface. It has been archived under `legacy/arduino_reference/` while the remaining Reticulum-native pieces continue to be ported.
 
 ## What This Refactor Changes
 
@@ -37,6 +37,8 @@ Implemented now:
 * NVS-backed runtime configuration store
 * Built-in HTTP configuration UI on a soft AP
 * Native WiFi telemetry uplink for `http://` POST and `udp://host:port`
+* Native SX127x LoRa transmit path for `AKITA_TRANSPORT_LORA`
+* Reticulum bridge uplink for `rns+udp://host:port`
 * Native BLE OBD GATT client for common ELM327-style and Nordic UART style adapters
 * Custom UART-based GPS reader with lightweight NMEA parsing
 * Custom JSON payload formatter
@@ -44,10 +46,10 @@ Implemented now:
 
 Still being ported:
 
-* Native LoRa radio backend
-* Native Reticulum transport/backend
+* Full native Reticulum packet/interface implementation on-device
+* LoRa receive/mesh behavior beyond the current transmit path
 
-That means the firmware structure is now native-first and ready for target-specific driver work, but the Reticulum transport path is not finished yet.
+That means the firmware structure is now native-first and the transport layer has real WiFi, LoRa transmit, and Reticulum bridge slices, but the fully native Reticulum stack is not finished yet.
 
 ## Repository Layout
 
@@ -120,9 +122,22 @@ The config portal starts a soft AP using the SSID from `menuconfig` and serves a
 * OBD adapter name
 * Optional OBD service and characteristic UUID overrides
 * Telemetry cadence
-* Telemetry endpoint for `http://` or `udp://` uplinks
+* Telemetry endpoint for `http://`, `udp://`, or `rns+udp://` uplinks
+* Optional Reticulum destination hash for bridge delivery
 
 See `docs/configuration_guide.md` for the full flow.
+
+## Reticulum Bridge
+
+The current Reticulum integration is a bridge, not a full on-device protocol port.
+
+Set the firmware telemetry endpoint to `rns+udp://host:port` and run the bundled bridge utility on a machine that has access to a Reticulum instance:
+
+```bash
+python3 tools/akita_reticulum_bridge.py --listen-port 4242 --config ~/.reticulum
+```
+
+The firmware will forward telemetry to that UDP bridge, and the bridge will inject it into Reticulum either as a directed packet to the configured destination hash or as a plain broadcast when the destination field is empty.
 
 ## Design Direction
 

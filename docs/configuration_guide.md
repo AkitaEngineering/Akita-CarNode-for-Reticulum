@@ -31,7 +31,8 @@ Current runtime fields:
 * vehicle ID
 * transport mode
 * WiFi SSID and password
-* telemetry endpoint for `http://` or `udp://host:port`
+* telemetry endpoint for `http://`, `udp://host:port`, or `rns+udp://host:port`
+* optional Reticulum destination hash for bridge delivery
 * OBD adapter name
 * optional OBD service UUID and characteristic UUID overrides
 * GPS RX pin
@@ -60,8 +61,10 @@ Current runtime fields:
 
 ## Notes
 
-* The transport component now supports native WiFi uplink to `http://` and `udp://host:port` endpoints.
-* Native LoRa and native Reticulum backends are still pending.
+* The transport component now supports native WiFi uplink to `http://`, `udp://host:port`, and `rns+udp://host:port` endpoints.
+* `rns+udp://host:port` expects the bundled `tools/akita_reticulum_bridge.py` utility or another compatible bridge on the target host.
+* The LoRa transport path is currently transmit-only and targets SX127x-class boards such as Heltec LoRa 32 V2.
+* A full native Reticulum implementation on-device is still pending.
 * The OBD component now uses a native BLE GATT client for common ELM327-style and Nordic UART style adapters.
 * For non-default adapters, the config portal can now store custom OBD service and characteristic UUID values.
 * The archived Arduino implementation remains under `legacy/arduino_reference/` only as migration reference.

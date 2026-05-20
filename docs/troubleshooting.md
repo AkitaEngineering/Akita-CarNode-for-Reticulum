@@ -67,18 +67,32 @@ Check the following:
 
 * Transport mode is set to WiFi.
 * The WiFi SSID fits normal station limits and matches the target network.
-* The endpoint uses a currently supported scheme: `http://` or `udp://host:port`.
+* The endpoint uses a currently supported scheme: `http://`, `udp://host:port`, or `rns+udp://host:port`.
 * The live-apply response in the portal did not report a runtime apply failure.
 
 With the config portal enabled, the firmware runs the portal soft AP and the WiFi station uplink together.
 
-### LoRa transport is not live yet
+### LoRa transport does not publish
 
-Board defaults and pin storage exist, but the native LoRa backend still needs to be implemented.
+Check the following:
 
-### Reticulum transport is not live yet
+* Transport mode is set to LoRa.
+* The board really uses an SX1276/SX1278-class radio on the configured SPI pins.
+* The configured LoRa frequency matches the region and radio setup.
+* The JSON payload fits within a single LoRa frame. The current SX127x path rejects payloads above 255 bytes.
 
-This repository now targets a native ESP-IDF transport layer, but the actual native Reticulum backend is still pending. The workspace copy of `Reticulum/` is the Python reference implementation, not a drop-in ESP-IDF transport.
+The current LoRa backend is a native transmit-only path. It does not implement receive handling or a full Reticulum-over-LoRa interface yet.
+
+### Reticulum bridge does not deliver
+
+Check the following:
+
+* Transport mode is set to WiFi.
+* The telemetry endpoint is `rns+udp://host:port` and points to the machine running `tools/akita_reticulum_bridge.py`.
+* The bridge host can reach the same WiFi network as the device.
+* The Reticulum destination hash is either empty for plain broadcast or matches a reachable Reticulum destination with a known path.
+
+The bundled bridge uses the Python Reticulum stack on a host machine. A full native Reticulum implementation on the ESP target is still pending.
 
 ## Power And Stability
 

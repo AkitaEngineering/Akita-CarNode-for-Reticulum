@@ -71,7 +71,8 @@ static const char kConfigPage[] =
 "          <label>Transport<select name=\"transport_mode\"><option value=\"wifi\">WiFi uplink</option><option value=\"lora\">LoRa uplink</option><option value=\"none\">Local only</option></select></label>\n"
 "          <label>WiFi SSID<input name=\"wifi_ssid\" maxlength=\"63\"></label>\n"
 "          <label>WiFi password<input name=\"wifi_password\" type=\"password\" maxlength=\"63\"></label>\n"
-"          <label>Endpoint or destination<input name=\"telemetry_endpoint\" maxlength=\"95\" placeholder=\"reticulum/native/backend\"></label>\n"
+"          <label>Telemetry endpoint<input name=\"telemetry_endpoint\" maxlength=\"95\" placeholder=\"http://host/path, udp://host:port, rns+udp://host:port\"></label>\n"
+"          <label>Reticulum destination<input name=\"reticulum_destination\" maxlength=\"63\" placeholder=\"32 hex chars, or leave empty to broadcast\"></label>\n"
 "        </section>\n"
 "        <section class=\"panel\">\n"
 "          <h2>Vehicle I/O</h2>\n"
@@ -228,14 +229,16 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
     char vehicle_id[80];
     char wifi_ssid[96];
     char endpoint[128];
+    char reticulum_destination[160];
     char obd_name[96];
     char obd_service_uuid[64];
     char obd_characteristic_uuid[64];
-    char response[1024];
+    char response[1184];
 
     akita_json_escape(g_runtime_config->vehicle_id, vehicle_id, sizeof(vehicle_id));
     akita_json_escape(g_runtime_config->wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     akita_json_escape(g_runtime_config->telemetry_endpoint, endpoint, sizeof(endpoint));
+    akita_json_escape(g_runtime_config->reticulum_destination, reticulum_destination, sizeof(reticulum_destination));
     akita_json_escape(g_runtime_config->obd_device_name, obd_name, sizeof(obd_name));
     akita_json_escape(g_runtime_config->obd_service_uuid, obd_service_uuid, sizeof(obd_service_uuid));
     akita_json_escape(g_runtime_config->obd_characteristic_uuid, obd_characteristic_uuid, sizeof(obd_characteristic_uuid));
@@ -244,7 +247,7 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
         response,
         sizeof(response),
         "{\"vehicle_id\":\"%s\",\"board_name\":\"%s\",\"transport_mode\":\"%s\","
-        "\"wifi_ssid\":\"%s\",\"telemetry_endpoint\":\"%s\",\"obd_device_name\":\"%s\","
+        "\"wifi_ssid\":\"%s\",\"telemetry_endpoint\":\"%s\",\"reticulum_destination\":\"%s\",\"obd_device_name\":\"%s\","
         "\"use_obd_uuid\":%s,\"obd_service_uuid\":\"%s\",\"obd_characteristic_uuid\":\"%s\","
         "\"telemetry_interval_ms\":%lu,\"gps_rx_pin\":%ld,\"gps_tx_pin\":%ld,\"gps_uart_baud\":%lu,"
         "\"enable_gps\":%s}",
@@ -254,6 +257,7 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
         (g_runtime_config->transport_mode == AKITA_TRANSPORT_WIFI) ? "wifi" : "none",
         wifi_ssid,
         endpoint,
+        reticulum_destination,
         obd_name,
         g_runtime_config->use_obd_uuid ? "true" : "false",
         obd_service_uuid,
@@ -298,6 +302,9 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     }
     if (akita_form_get_value(body, "telemetry_endpoint", scratch, sizeof(scratch))) {
         akita_copy_string(g_runtime_config->telemetry_endpoint, sizeof(g_runtime_config->telemetry_endpoint), scratch);
+    }
+    if (akita_form_get_value(body, "reticulum_destination", scratch, sizeof(scratch))) {
+        akita_copy_string(g_runtime_config->reticulum_destination, sizeof(g_runtime_config->reticulum_destination), scratch);
     }
     if (akita_form_get_value(body, "obd_device_name", scratch, sizeof(scratch))) {
         akita_copy_string(g_runtime_config->obd_device_name, sizeof(g_runtime_config->obd_device_name), scratch);

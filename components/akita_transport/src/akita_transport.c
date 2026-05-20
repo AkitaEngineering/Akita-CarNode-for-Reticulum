@@ -1,17 +1,23 @@
 #include "akita_transport.h"
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
 
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_check.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
@@ -19,26 +25,88 @@
 #define AKITA_TRANSPORT_HTTP_TIMEOUT_MS 8000
 #define AKITA_TRANSPORT_UDP_HOST_MAX_LEN 80
 #define AKITA_TRANSPORT_UDP_PORT_MAX_LEN 8
+#define AKITA_TRANSPORT_LORA_SPI_HOST SPI2_HOST
+#define AKITA_TRANSPORT_LORA_SPI_CLOCK_HZ (1000 * 1000)
+#define AKITA_TRANSPORT_LORA_TX_TIMEOUT_MS 5000
+#define AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN 255U
+#define AKITA_TRANSPORT_LORA_FREQUENCY_STEP_HZ 61.03515625
+
+#define AKITA_LORA_REG_FIFO 0x00
+#define AKITA_LORA_REG_OP_MODE 0x01
+#define AKITA_LORA_REG_FRF_MSB 0x06
+#define AKITA_LORA_REG_FRF_MID 0x07
+#define AKITA_LORA_REG_FRF_LSB 0x08
+#define AKITA_LORA_REG_PA_CONFIG 0x09
+#define AKITA_LORA_REG_OCP 0x0B
+#define AKITA_LORA_REG_LNA 0x0C
+#define AKITA_LORA_REG_FIFO_ADDR_PTR 0x0D
+#define AKITA_LORA_REG_FIFO_TX_BASE_ADDR 0x0E
+#define AKITA_LORA_REG_FIFO_RX_BASE_ADDR 0x0F
+#define AKITA_LORA_REG_IRQ_FLAGS 0x12
+#define AKITA_LORA_REG_MODEM_CONFIG_1 0x1D
+#define AKITA_LORA_REG_MODEM_CONFIG_2 0x1E
+#define AKITA_LORA_REG_PREAMBLE_MSB 0x20
+#define AKITA_LORA_REG_PREAMBLE_LSB 0x21
+#define AKITA_LORA_REG_PAYLOAD_LENGTH 0x22
+#define AKITA_LORA_REG_MODEM_CONFIG_3 0x26
+#define AKITA_LORA_REG_DETECTION_OPTIMIZE 0x31
+#define AKITA_LORA_REG_DETECTION_THRESHOLD 0x37
+#define AKITA_LORA_REG_SYNC_WORD 0x39
+#define AKITA_LORA_REG_DIO_MAPPING_1 0x40
+#define AKITA_LORA_REG_VERSION 0x42
+#define AKITA_LORA_REG_PA_DAC 0x4D
+
+#define AKITA_LORA_MODE_LONG_RANGE 0x80
+#define AKITA_LORA_MODE_SLEEP 0x00
+#define AKITA_LORA_MODE_STDBY 0x01
+#define AKITA_LORA_MODE_TX 0x03
+
+#define AKITA_LORA_PA_BOOST 0x80
+#define AKITA_LORA_PA_DAC_ENABLE 0x07
+#define AKITA_LORA_PA_DAC_DISABLE 0x04
+#define AKITA_LORA_IRQ_TX_DONE 0x08
+#define AKITA_LORA_EXPECTED_VERSION 0x12
 
 static const char *TAG = "akita_transport";
 typedef enum {
     AKITA_TRANSPORT_ENDPOINT_NONE = 0,
     AKITA_TRANSPORT_ENDPOINT_HTTP,
     AKITA_TRANSPORT_ENDPOINT_UDP,
+    AKITA_TRANSPORT_ENDPOINT_RNS_UDP,
+    AKITA_TRANSPORT_ENDPOINT_LORA,
 } akita_transport_endpoint_t;
 
 static EventGroupHandle_t g_wifi_event_group;
 static esp_event_handler_instance_t g_wifi_event_handler;
 static esp_event_handler_instance_t g_ip_event_handler;
 static esp_netif_t *g_sta_netif;
+static spi_device_handle_t g_lora_spi;
 static bool g_event_handlers_registered;
+static bool g_lora_spi_bus_initialized;
+static bool g_lora_ready;
 static bool g_wifi_connected;
 static bool g_transport_ready;
 static bool g_wifi_transport_enabled;
+static akita_transport_mode_t g_transport_mode;
 static akita_transport_endpoint_t g_endpoint_type;
 
 static void akita_transport_update_ready_state(void) {
-    g_transport_ready = g_wifi_transport_enabled && g_wifi_connected && g_endpoint_type != AKITA_TRANSPORT_ENDPOINT_NONE;
+    switch (g_transport_mode) {
+        case AKITA_TRANSPORT_WIFI:
+            g_transport_ready = g_wifi_transport_enabled &&
+                                g_wifi_connected &&
+                                g_endpoint_type != AKITA_TRANSPORT_ENDPOINT_NONE &&
+                                g_endpoint_type != AKITA_TRANSPORT_ENDPOINT_LORA;
+            break;
+
+        case AKITA_TRANSPORT_LORA:
+            g_transport_ready = g_lora_ready;
+            break;
+
+        default:
+            g_transport_ready = false;
+            break;
+    }
 }
 
 static void akita_transport_disable_wifi_uplink(void) {
@@ -57,9 +125,280 @@ static void akita_transport_disable_wifi_uplink(void) {
     }
 }
 
+static bool akita_transport_pin_is_valid(int32_t pin) {
+    return pin >= 0 && pin < GPIO_NUM_MAX;
+}
+
+static void akita_transport_disable_lora_uplink(void) {
+    esp_err_t err;
+
+    g_lora_ready = false;
+    if (g_endpoint_type == AKITA_TRANSPORT_ENDPOINT_LORA) {
+        g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_NONE;
+    }
+    akita_transport_update_ready_state();
+
+    if (g_lora_spi != NULL) {
+        err = spi_bus_remove_device(g_lora_spi);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "LoRa SPI device removal failed: %s", esp_err_to_name(err));
+        }
+        g_lora_spi = NULL;
+    }
+
+    if (g_lora_spi_bus_initialized) {
+        err = spi_bus_free(AKITA_TRANSPORT_LORA_SPI_HOST);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "LoRa SPI bus free failed: %s", esp_err_to_name(err));
+        }
+        g_lora_spi_bus_initialized = false;
+    }
+}
+
+static esp_err_t akita_transport_lora_transfer(
+    const uint8_t *tx_data,
+    uint8_t *rx_data,
+    size_t byte_count
+) {
+    spi_transaction_t transaction = {0};
+
+    if (g_lora_spi == NULL || tx_data == NULL || byte_count == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    transaction.length = byte_count * 8U;
+    transaction.tx_buffer = tx_data;
+    transaction.rx_buffer = rx_data;
+    return spi_device_polling_transmit(g_lora_spi, &transaction);
+}
+
+static esp_err_t akita_transport_lora_write_register(uint8_t address, uint8_t value) {
+    const uint8_t tx_data[2] = { (uint8_t) (address | 0x80U), value };
+    return akita_transport_lora_transfer(tx_data, NULL, sizeof(tx_data));
+}
+
+static esp_err_t akita_transport_lora_read_register(uint8_t address, uint8_t *value) {
+    uint8_t tx_data[2] = { (uint8_t) (address & 0x7FU), 0x00 };
+    uint8_t rx_data[2] = {0};
+    esp_err_t err;
+
+    if (value == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = akita_transport_lora_transfer(tx_data, rx_data, sizeof(tx_data));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *value = rx_data[1];
+    return ESP_OK;
+}
+
+static esp_err_t akita_transport_lora_write_fifo(const uint8_t *payload, size_t payload_len) {
+    uint8_t *buffer;
+    esp_err_t err;
+
+    if (payload == NULL || payload_len == 0U || payload_len > AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    buffer = malloc(payload_len + 1U);
+    if (buffer == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    buffer[0] = (uint8_t) (AKITA_LORA_REG_FIFO | 0x80U);
+    memcpy(buffer + 1U, payload, payload_len);
+    err = akita_transport_lora_transfer(buffer, NULL, payload_len + 1U);
+    free(buffer);
+    return err;
+}
+
+static esp_err_t akita_transport_lora_reset(const akita_runtime_config_t *config) {
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!akita_transport_pin_is_valid(config->lora_reset_pin)) {
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_reset_pin((gpio_num_t) config->lora_reset_pin), TAG, "LoRa reset pin reset failed");
+    ESP_RETURN_ON_ERROR(gpio_set_direction((gpio_num_t) config->lora_reset_pin, GPIO_MODE_OUTPUT), TAG, "LoRa reset pin direction failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t) config->lora_reset_pin, 0), TAG, "LoRa reset pin assert failed");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t) config->lora_reset_pin, 1), TAG, "LoRa reset pin release failed");
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return ESP_OK;
+}
+
+static esp_err_t akita_transport_lora_set_frequency(uint32_t frequency_hz) {
+    uint32_t frf_value;
+
+    if (frequency_hz == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    frf_value = (uint32_t) (((double) frequency_hz) / AKITA_TRANSPORT_LORA_FREQUENCY_STEP_HZ);
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_FRF_MSB, (uint8_t) (frf_value >> 16)), TAG, "LoRa FRF MSB write failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_FRF_MID, (uint8_t) (frf_value >> 8)), TAG, "LoRa FRF MID write failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_FRF_LSB, (uint8_t) frf_value), TAG, "LoRa FRF LSB write failed");
+    return ESP_OK;
+}
+
+static esp_err_t akita_transport_configure_lora(const akita_runtime_config_t *config) {
+    spi_bus_config_t bus_config = {0};
+    spi_device_interface_config_t device_config = {0};
+    uint8_t version = 0;
+    esp_err_t err;
+    esp_err_t ret = ESP_OK;
+
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    akita_transport_disable_lora_uplink();
+
+    if (config->transport_mode != AKITA_TRANSPORT_LORA) {
+        return ESP_OK;
+    }
+
+    if (!akita_transport_pin_is_valid(config->lora_sck_pin) ||
+        !akita_transport_pin_is_valid(config->lora_miso_pin) ||
+        !akita_transport_pin_is_valid(config->lora_mosi_pin) ||
+        !akita_transport_pin_is_valid(config->lora_cs_pin) ||
+        config->lora_frequency_hz == 0U) {
+        ESP_LOGW(TAG, "LoRa transport selected, but pins or frequency are not configured");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bus_config.mosi_io_num = config->lora_mosi_pin;
+    bus_config.miso_io_num = config->lora_miso_pin;
+    bus_config.sclk_io_num = config->lora_sck_pin;
+    bus_config.quadwp_io_num = -1;
+    bus_config.quadhd_io_num = -1;
+    bus_config.max_transfer_sz = AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN + 1U;
+
+    device_config.clock_speed_hz = AKITA_TRANSPORT_LORA_SPI_CLOCK_HZ;
+    device_config.mode = 0;
+    device_config.spics_io_num = config->lora_cs_pin;
+    device_config.queue_size = 1;
+
+    err = spi_bus_initialize(AKITA_TRANSPORT_LORA_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        return err;
+    }
+    g_lora_spi_bus_initialized = true;
+
+    err = spi_bus_add_device(AKITA_TRANSPORT_LORA_SPI_HOST, &device_config, &g_lora_spi);
+    if (err != ESP_OK) {
+        akita_transport_disable_lora_uplink();
+        return err;
+    }
+
+    err = akita_transport_lora_reset(config);
+    if (err != ESP_OK) {
+        akita_transport_disable_lora_uplink();
+        return err;
+    }
+
+    err = akita_transport_lora_read_register(AKITA_LORA_REG_VERSION, &version);
+    if (err != ESP_OK) {
+        akita_transport_disable_lora_uplink();
+        return err;
+    }
+
+    if (version != AKITA_LORA_EXPECTED_VERSION) {
+        ESP_LOGW(TAG, "Unexpected SX127x version 0x%02x while configuring LoRa transport", version);
+    }
+
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_SLEEP), fail, TAG, "LoRa sleep mode failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_FIFO_TX_BASE_ADDR, 0x00), fail, TAG, "LoRa TX base setup failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_FIFO_RX_BASE_ADDR, 0x00), fail, TAG, "LoRa RX base setup failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_set_frequency(config->lora_frequency_hz), fail, TAG, "LoRa frequency setup failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_PA_CONFIG, AKITA_LORA_PA_BOOST | 0x0F), fail, TAG, "LoRa PA config failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OCP, 0x2B), fail, TAG, "LoRa OCP config failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_LNA, 0x23), fail, TAG, "LoRa LNA config failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_MODEM_CONFIG_1, 0x72), fail, TAG, "LoRa modem config1 failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_MODEM_CONFIG_2, 0x74), fail, TAG, "LoRa modem config2 failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_MODEM_CONFIG_3, 0x04), fail, TAG, "LoRa modem config3 failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_PREAMBLE_MSB, 0x00), fail, TAG, "LoRa preamble MSB failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_PREAMBLE_LSB, 0x08), fail, TAG, "LoRa preamble LSB failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_DETECTION_OPTIMIZE, 0xC3), fail, TAG, "LoRa detect optimize failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_DETECTION_THRESHOLD, 0x0A), fail, TAG, "LoRa detect threshold failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_SYNC_WORD, 0x12), fail, TAG, "LoRa sync word failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_DIO_MAPPING_1, 0x00), fail, TAG, "LoRa DIO mapping failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_PA_DAC, AKITA_LORA_PA_DAC_DISABLE), fail, TAG, "LoRa PA DAC failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, 0xFF), fail, TAG, "LoRa IRQ clear failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY), fail, TAG, "LoRa standby mode failed");
+
+    g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_LORA;
+    g_lora_ready = true;
+    akita_transport_update_ready_state();
+    ESP_LOGI(TAG, "LoRa transport configured at %lu Hz", (unsigned long) config->lora_frequency_hz);
+    return ESP_OK;
+
+fail:
+    akita_transport_disable_lora_uplink();
+    return ret;
+}
+
+static esp_err_t akita_transport_publish_lora(const char *payload) {
+    size_t payload_len;
+    int64_t deadline_us;
+    uint8_t irq_flags = 0;
+    esp_err_t err;
+
+    if (payload == NULL || payload[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!g_lora_ready || g_lora_spi == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    payload_len = strlen(payload);
+    if (payload_len > AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN) {
+        ESP_LOGW(TAG, "LoRa payload is %u bytes, exceeding the SX127x maximum of %u bytes", (unsigned) payload_len, (unsigned) AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY), TAG, "LoRa standby before TX failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, 0xFF), TAG, "LoRa IRQ clear before TX failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_FIFO_ADDR_PTR, 0x00), TAG, "LoRa FIFO pointer reset failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_fifo((const uint8_t *) payload, payload_len), TAG, "LoRa FIFO write failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_PAYLOAD_LENGTH, (uint8_t) payload_len), TAG, "LoRa payload length write failed");
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_TX), TAG, "LoRa TX mode failed");
+
+    deadline_us = esp_timer_get_time() + ((int64_t) AKITA_TRANSPORT_LORA_TX_TIMEOUT_MS * 1000LL);
+    while (esp_timer_get_time() < deadline_us) {
+        err = akita_transport_lora_read_register(AKITA_LORA_REG_IRQ_FLAGS, &irq_flags);
+        if (err != ESP_OK) {
+            akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY);
+            return err;
+        }
+
+        if ((irq_flags & AKITA_LORA_IRQ_TX_DONE) != 0U) {
+            ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, irq_flags), TAG, "LoRa IRQ clear after TX failed");
+            ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY), TAG, "LoRa standby after TX failed");
+            return ESP_OK;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY));
+    return ESP_ERR_TIMEOUT;
+}
+
 static akita_transport_endpoint_t akita_transport_endpoint_type(const char *endpoint) {
     if (endpoint == NULL || endpoint[0] == '\0') {
         return AKITA_TRANSPORT_ENDPOINT_NONE;
+    }
+
+    if (strncasecmp(endpoint, "rns+udp://", 10) == 0) {
+        return AKITA_TRANSPORT_ENDPOINT_RNS_UDP;
     }
 
     if (strncasecmp(endpoint, "http://", 7) == 0) {
@@ -71,6 +410,36 @@ static akita_transport_endpoint_t akita_transport_endpoint_type(const char *endp
     }
 
     return AKITA_TRANSPORT_ENDPOINT_NONE;
+}
+
+static void akita_transport_json_escape(const char *input, char *output, size_t output_size) {
+    size_t used = 0;
+
+    if (output == NULL || output_size == 0U) {
+        return;
+    }
+
+    while (input != NULL && *input != '\0' && (used + 1U) < output_size) {
+        if ((*input == '"' || *input == '\\') && (used + 2U) < output_size) {
+            output[used++] = '\\';
+            output[used++] = *input;
+        } else if (*input == '\n' && (used + 2U) < output_size) {
+            output[used++] = '\\';
+            output[used++] = 'n';
+        } else if (*input == '\r' && (used + 2U) < output_size) {
+            output[used++] = '\\';
+            output[used++] = 'r';
+        } else if (*input == '\t' && (used + 2U) < output_size) {
+            output[used++] = '\\';
+            output[used++] = 't';
+        } else {
+            output[used++] = *input;
+        }
+
+        ++input;
+    }
+
+    output[used] = '\0';
 }
 
 static void akita_transport_wifi_event_handler(
@@ -320,8 +689,9 @@ static esp_err_t akita_transport_publish_http(const char *endpoint, const char *
     return ESP_OK;
 }
 
-static esp_err_t akita_transport_parse_udp_endpoint(
+static esp_err_t akita_transport_parse_host_port_endpoint(
     const char *endpoint,
+    const char *scheme,
     char *host,
     size_t host_size,
     char *port,
@@ -334,12 +704,19 @@ static esp_err_t akita_transport_parse_udp_endpoint(
     size_t host_length;
     size_t port_length;
 
-    if (endpoint == NULL || host == NULL || port == NULL ||
-        host_size == 0U || port_size == 0U || strncasecmp(endpoint, "udp://", 6) != 0) {
+    size_t scheme_len;
+
+    if (endpoint == NULL || scheme == NULL || host == NULL || port == NULL ||
+        host_size == 0U || port_size == 0U) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    host_start = endpoint + 6;
+    scheme_len = strlen(scheme);
+    if (strncasecmp(endpoint, scheme, scheme_len) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    host_start = endpoint + scheme_len;
     port_start = strrchr(host_start, ':');
     if (port_start == NULL || port_start == host_start) {
         return ESP_ERR_INVALID_ARG;
@@ -362,18 +739,19 @@ static esp_err_t akita_transport_parse_udp_endpoint(
     return ESP_OK;
 }
 
-static esp_err_t akita_transport_publish_udp(const char *endpoint, const char *payload) {
+static esp_err_t akita_transport_publish_udp_datagram(
+    const char *host,
+    const char *port,
+    const char *payload,
+    size_t payload_len
+) {
     struct addrinfo hints = {0};
     struct addrinfo *result = NULL;
     int socket_fd = -1;
     int sent_bytes;
-    char host[AKITA_TRANSPORT_UDP_HOST_MAX_LEN];
-    char port[AKITA_TRANSPORT_UDP_PORT_MAX_LEN];
-    esp_err_t err;
 
-    err = akita_transport_parse_udp_endpoint(endpoint, host, sizeof(host), port, sizeof(port));
-    if (err != ESP_OK) {
-        return err;
+    if (host == NULL || port == NULL || payload == NULL || payload_len == 0U) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     hints.ai_family = AF_UNSPEC;
@@ -388,14 +766,70 @@ static esp_err_t akita_transport_publish_udp(const char *endpoint, const char *p
         return ESP_FAIL;
     }
 
-    sent_bytes = (int) sendto(socket_fd, payload, strlen(payload), 0, result->ai_addr, result->ai_addrlen);
+    sent_bytes = (int) sendto(socket_fd, payload, payload_len, 0, result->ai_addr, result->ai_addrlen);
     freeaddrinfo(result);
     close(socket_fd);
-    if (sent_bytes < 0) {
+    if (sent_bytes < 0 || (size_t) sent_bytes != payload_len) {
         return ESP_FAIL;
     }
 
     return ESP_OK;
+}
+
+static esp_err_t akita_transport_publish_udp(const char *endpoint, const char *payload) {
+    char host[AKITA_TRANSPORT_UDP_HOST_MAX_LEN];
+    char port[AKITA_TRANSPORT_UDP_PORT_MAX_LEN];
+    esp_err_t err;
+
+    err = akita_transport_parse_host_port_endpoint(endpoint, "udp://", host, sizeof(host), port, sizeof(port));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return akita_transport_publish_udp_datagram(host, port, payload, strlen(payload));
+}
+
+static esp_err_t akita_transport_publish_rns_udp(const akita_runtime_config_t *config, const char *payload) {
+    char host[AKITA_TRANSPORT_UDP_HOST_MAX_LEN];
+    char port[AKITA_TRANSPORT_UDP_PORT_MAX_LEN];
+    char escaped_vehicle_id[80];
+    char escaped_destination[160];
+    char *envelope = NULL;
+    size_t payload_len;
+    size_t envelope_size;
+    esp_err_t err;
+
+    if (config == NULL || payload == NULL || payload[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = akita_transport_parse_host_port_endpoint(config->telemetry_endpoint, "rns+udp://", host, sizeof(host), port, sizeof(port));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    akita_transport_json_escape(config->vehicle_id, escaped_vehicle_id, sizeof(escaped_vehicle_id));
+    akita_transport_json_escape(config->reticulum_destination, escaped_destination, sizeof(escaped_destination));
+
+    payload_len = strlen(payload);
+    envelope_size = payload_len + strlen(escaped_vehicle_id) + strlen(escaped_destination) + 96U;
+    envelope = malloc(envelope_size);
+    if (envelope == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(
+        envelope,
+        envelope_size,
+        "{\"bridge\":\"akita-rns-udp-v1\",\"vehicle_id\":\"%s\",\"destination\":\"%s\",\"payload\":%s}",
+        escaped_vehicle_id,
+        escaped_destination,
+        payload
+    );
+
+    err = akita_transport_publish_udp_datagram(host, port, envelope, strlen(envelope));
+    free(envelope);
+    return err;
 }
 
 esp_err_t akita_transport_init(const akita_runtime_config_t *config) {
@@ -405,8 +839,11 @@ esp_err_t akita_transport_init(const akita_runtime_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    g_transport_mode = config->transport_mode;
+
     if (config->transport_mode == AKITA_TRANSPORT_NONE) {
         akita_transport_disable_wifi_uplink();
+        akita_transport_disable_lora_uplink();
         g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_NONE;
         ESP_LOGI(TAG, "Transport disabled; telemetry will stay local");
         return ESP_OK;
@@ -414,10 +851,20 @@ esp_err_t akita_transport_init(const akita_runtime_config_t *config) {
 
     if (config->transport_mode == AKITA_TRANSPORT_LORA) {
         akita_transport_disable_wifi_uplink();
-        g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_NONE;
-        ESP_LOGW(TAG, "LoRa transport backend is not implemented yet");
-        return ESP_ERR_NOT_SUPPORTED;
+        err = akita_transport_configure_lora(config);
+        if (err != ESP_OK) {
+            akita_transport_disable_lora_uplink();
+            return err;
+        }
+
+        if (!g_transport_ready) {
+            ESP_LOGI(TAG, "LoRa transport is initializing; telemetry will publish when the radio is ready");
+        }
+
+        return ESP_OK;
     }
+
+    akita_transport_disable_lora_uplink();
 
     err = akita_transport_configure_wifi(config);
     if (err != ESP_OK) {
@@ -437,6 +884,12 @@ esp_err_t akita_transport_publish(const akita_runtime_config_t *config, const ch
 
     if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    g_transport_mode = config->transport_mode;
+
+    if (config->transport_mode == AKITA_TRANSPORT_LORA) {
+        return akita_transport_publish_lora(payload);
     }
 
     if (config->transport_mode != AKITA_TRANSPORT_WIFI) {
@@ -464,6 +917,8 @@ esp_err_t akita_transport_publish(const akita_runtime_config_t *config, const ch
             return akita_transport_publish_http(config->telemetry_endpoint, payload);
         case AKITA_TRANSPORT_ENDPOINT_UDP:
             return akita_transport_publish_udp(config->telemetry_endpoint, payload);
+        case AKITA_TRANSPORT_ENDPOINT_RNS_UDP:
+            return akita_transport_publish_rns_udp(config, payload);
         default:
             return ESP_ERR_NOT_SUPPORTED;
     }
