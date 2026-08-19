@@ -27,9 +27,9 @@ Wire the GPS module as follows:
 * GPS VCC -> board 3.3V or 5V as required by the module
 * GPS GND -> board GND
 * GPS TX -> configured GPS RX pin
-* GPS RX -> configured GPS TX pin
+* GPS RX -> configured GPS TX pin, or leave TX unassigned if the module does not need configuration commands
 
-Set the final RX, TX, and baud values in the config portal after boot.
+Set the final RX, TX, and baud values in the config portal after boot. GPS TX on the ESP is optional; GPS RX is required.
 
 ### BLE OBD-II
 
@@ -37,12 +37,13 @@ The OBD adapter remains wireless.
 
 * Plug the adapter into the vehicle OBD-II port.
 * Ensure the vehicle ignition state powers the adapter.
+* Set the advertised adapter name in the config portal. The firmware will not connect to arbitrary BLE devices if the name and UUID filters are empty.
 
 ### LoRa
 
-The native LoRa backend is not finished yet, but wiring can still be prepared.
+The native LoRa path is an SX127x backend with transmit and receive harvesting. Telemetry is sent as a compact JSON frame that fits a single 255-byte packet.
 
-For Heltec LoRa 32 V2, the current board profile seeds these defaults:
+For Heltec LoRa 32 V2, the board profile seeds these defaults:
 
 * SCK -> GPIO5
 * MISO -> GPIO19
@@ -52,7 +53,9 @@ For Heltec LoRa 32 V2, the current board profile seeds these defaults:
 * DIO0 -> GPIO26
 * LED -> GPIO25
 
-Always verify the actual board revision before trusting defaults.
+Always verify the actual board revision before trusting defaults. Heltec LoRa 32 V2 requires `idf.py set-target esp32`.
+
+Set the LoRa frequency in the config portal to match your region, commonly 915000000 Hz or 868000000 Hz.
 
 ### Status LED
 
@@ -66,13 +69,14 @@ These profiles are intentionally conservative. Expect to set UART pins and any e
 
 ### Heltec LoRa 32 V2
 
-This profile seeds known LoRa and LED defaults, making it the quickest target for LoRa-oriented bring-up once the native radio backend lands.
+This profile seeds known LoRa and LED defaults. Use the ESP32 chip target, not ESP32-S3.
 
 ## Bring-Up Recommendations
 
 1. Power the board from a stable bench supply or good USB source first.
 2. Boot with the config portal enabled.
-3. Set GPS pins and baud through the portal.
-4. Confirm GPS output in the serial log.
-5. Add BLE OBD validation after the native GATT client is completed.
-6. Add LoRa validation after the native radio backend is completed.
+3. Join `Akita-CarNode-Setup` with password `akita-setup` unless you changed those values in `menuconfig`.
+4. Set GPS pins and baud through the portal.
+5. Confirm GPS output in the serial log.
+6. Confirm BLE OBD connection using the configured adapter name.
+7. Validate LoRa or WiFi uplink once the radio or station credentials are configured.

@@ -15,5 +15,11 @@ size_t akita_payload_write_json(
     char *buffer,
     size_t buffer_size
 );
+size_t akita_payload_write_compact_json(
+    const akita_runtime_config_t *config,
+    const akita_vehicle_telemetry_t *telemetry,
+    char *buffer,
+    size_t buffer_size
+);
 
 #endif

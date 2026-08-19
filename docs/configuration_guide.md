@@ -1,6 +1,6 @@
 # Native Configuration Guide
 
-The active firmware now uses two clear configuration layers instead of a single Arduino header.
+The firmware uses two configuration layers.
 
 ## Build-Time Configuration
 
@@ -22,6 +22,8 @@ Board profiles currently available:
 
 The profile sets board defaults such as LoRa pins, LED pin, and initial transport mode.
 
+The default config portal password is `akita-setup`. Change it before deploying a node in the field. WPA2 requires 8 to 63 characters.
+
 ## Runtime Configuration
 
 Runtime settings are stored in NVS and edited through the built-in HTTP portal.
@@ -31,7 +33,7 @@ Current runtime fields:
 * vehicle ID
 * transport mode
 * WiFi SSID and password
-* telemetry endpoint for `http://`, `udp://host:port`, or `rns+udp://host:port`
+* telemetry endpoint for `http://`, `https://`, `udp://host:port`, or `rns+udp://host:port`
 * optional Reticulum destination hash for bridge delivery
 * OBD adapter name
 * optional OBD service UUID and characteristic UUID overrides
@@ -40,13 +42,21 @@ Current runtime fields:
 * GPS UART baud
 * telemetry interval
 * GPS enable flag
+* LoRa frequency in Hz
 
 The config portal also exposes a live runtime status panel for:
 
 * transport ready
+* WiFi uplink connected
+* WiFi RSSI
+* LoRa radio ready
 * Reticulum bridge ready
 * Reticulum bridge mode
 * last Reticulum bridge error
+
+The status panel is backed by the read-only `GET /api/status` endpoint, which is also useful for headless checks during bring-up.
+
+Leave the WiFi password field blank to keep the currently stored station password.
 
 ## Config Portal Flow
 
@@ -68,13 +78,11 @@ The config portal also exposes a live runtime status panel for:
 
 ## Notes
 
-* The transport component now supports native WiFi uplink to `http://`, `udp://host:port`, and `rns+udp://host:port` endpoints.
+* The transport component supports native WiFi uplink to `http://`, `https://`, `udp://host:port`, and `rns+udp://host:port` endpoints.
 * `rns+udp://host:port` expects the bundled `tools/akita_reticulum_bridge.py` utility or another compatible bridge on the target host.
 * The bundled bridge responds to `ping` and `telemetry` requests. The firmware treats the Reticulum bridge endpoint as ready only after one of those requests is acknowledged successfully.
-* Directed bridge delivery retries with exponential backoff before returning an error. Use the bridge flags `--delivery-attempts`, `--delivery-backoff-seconds`, `--delivery-backoff-factor`, and `--delivery-backoff-max` to tune that behavior.
-* The LoRa transport path is currently transmit-only and targets SX127x-class boards such as Heltec LoRa 32 V2.
-* A full native Reticulum implementation on-device is still pending.
-* The OBD component now uses a native BLE GATT client for common ELM327-style and Nordic UART style adapters.
-* For non-default adapters, the config portal can now store custom OBD service and characteristic UUID values.
+* Directed bridge delivery retries with exponential backoff and a delivery deadline. Use the bridge flags `--delivery-attempts`, `--delivery-backoff-seconds`, `--delivery-backoff-factor`, `--delivery-backoff-max`, and `--delivery-deadline-seconds` to tune that behavior.
+* The LoRa transport path uses compact JSON frames so a full telemetry snapshot fits in a single SX127x packet. The radio returns to receive after transmit.
+* The OBD component uses a native BLE GATT client for common ELM327-style and Nordic UART style adapters.
+* For non-default adapters, the config portal can store custom OBD service and characteristic UUID values.
 * The archived Arduino implementation remains under `legacy/arduino_reference/` only as migration reference.
-

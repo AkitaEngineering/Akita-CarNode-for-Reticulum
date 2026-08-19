@@ -2,7 +2,7 @@
 
 ## Goal
 
-The firmware is moving from an Arduino sketch into a native ESP-IDF component graph so board support, driver work, configuration, and telemetry transport can be managed explicitly.
+The firmware is a native ESP-IDF component graph so board support, driver work, configuration, and telemetry transport can be managed explicitly.
 
 ## Active Components
 
@@ -24,8 +24,9 @@ Responsibilities:
 
 * runtime bootstrap
 * periodic polling loop
-* payload creation
-* status LED pulse handling
+* full JSON and compact LoRa payload creation
+* non-blocking status LED pulse handling
+* task watchdog subscription
 
 ### `akita_config`
 
@@ -33,9 +34,11 @@ Owns configuration state and the built-in configuration portal.
 
 Responsibilities:
 
-* NVS-backed runtime config load/save
+* NVS-backed runtime config load/save with sanitization
 * WiFi soft AP startup
 * HTTP UI and save path
+* live runtime status JSON for the config portal
+* live reapply of GPS, OBD, and transport after save
 
 ### `akita_gps`
 
@@ -45,34 +48,48 @@ Responsibilities:
 
 * UART driver setup
 * NMEA buffering
-* GGA and RMC parsing
+* checksum handling
+* GGA and RMC parsing for common talker IDs
 * normalized GPS snapshot output
 
 ### `akita_obd`
 
-Owns native OBD logic boundaries.
+Owns native OBD logic.
 
-Current responsibilities:
+Responsibilities:
 
 * BLE scan and connection lifecycle
 * GATT service and characteristic discovery
 * command dispatch for common ELM327-style adapters
 * PID request formatting
 * PID response parsing for core telemetry fields
+* retries on timed-out PID requests
 
 ### `akita_transport`
 
 Owns the uplink boundary.
 
-Current responsibilities:
+Responsibilities:
 
 * abstract transport mode selection
 * WiFi station setup with AP+STA coexistence when the config portal is enabled
-* HTTP POST uplink for `http://` endpoints
+* HTTP and HTTPS POST uplink
 * UDP uplink for `udp://host:port` endpoints
-* native SX127x LoRa transmit path for supported board profiles
+* native SX127x LoRa transmit and receive harvesting
+* compact-frame publish for LoRa
 * Reticulum bridge envelopes for `rns+udp://host:port` endpoints
-* landing point for the remaining fully native Reticulum work
+* bridge request/response acknowledgements and bridge readiness/error tracking
+
+### `tools/akita_reticulum_bridge.py`
+
+Owns the host-side bridge between the firmware and the Python Reticulum stack.
+
+Current responsibilities:
+
+* accept UDP bridge requests from the firmware
+* answer `ping` and `telemetry` acknowledgements
+* inject telemetry into Reticulum as a plain broadcast or directed packet
+* retry directed delivery with exponential backoff and a delivery deadline
 
 ## Configuration Strategy
 
@@ -92,16 +109,14 @@ The current project defines profiles for:
 * Generic ESP32-C5
 * Heltec LoRa 32 V2
 
-The Heltec profile seeds LoRa pins and a status LED default. Generic profiles intentionally stay conservative and expect runtime pin configuration.
+The Heltec profile seeds LoRa pins and a status LED default. Generic profiles stay conservative and expect runtime pin configuration. Heltec LoRa 32 V2 is an ESP32 target, not ESP32-S3.
 
 ## Why The Arduino Tree Was Archived
 
 The Arduino code carried useful logic, but it also kept transport, board configuration, and application flow tied to sketch semantics and external Arduino libraries. The native project keeps the legacy tree available only as a migration reference under `legacy/arduino_reference/`.
 
-## Remaining Native Work
+## Production Transport Model
 
-The next meaningful implementation steps are:
+WiFi, LoRa, and the Reticulum host bridge are the production uplinks.
 
-1. Full native Reticulum transport integration on top of the new transport abstraction.
-2. LoRa receive path and Reticulum-over-LoRa interface behavior.
-3. Optional OTA and richer status endpoints once the transport path is stable.
+A full on-device Reticulum protocol stack is intentionally not part of this firmware. The ESP node collects vehicle telemetry and hands Reticulum delivery to `tools/akita_reticulum_bridge.py`, which already has a complete Python Reticulum implementation.

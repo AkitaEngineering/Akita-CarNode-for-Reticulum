@@ -11,13 +11,19 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#if __has_include("esp_crt_bundle.h")
+#include "esp_crt_bundle.h"
+#define AKITA_TRANSPORT_HAS_CRT_BUNDLE 1
+#endif
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
@@ -30,7 +36,10 @@
 #define AKITA_TRANSPORT_BRIDGE_ERROR_MAX_LEN 64
 #define AKITA_TRANSPORT_RNS_PROTOCOL "akita-rns-udp-v2"
 #define AKITA_TRANSPORT_RNS_RESPONSE_MAX_LEN 256
-#define AKITA_TRANSPORT_RNS_TIMEOUT_MS 1500
+#define AKITA_TRANSPORT_RNS_TIMEOUT_MS 12000
+#define AKITA_TRANSPORT_RNS_PING_INTERVAL_MS 5000U
+#define AKITA_TRANSPORT_WIFI_RETRY_MIN_MS 1000U
+#define AKITA_TRANSPORT_WIFI_RETRY_MAX_MS 30000U
 #define AKITA_TRANSPORT_LORA_SPI_HOST SPI2_HOST
 #define AKITA_TRANSPORT_LORA_SPI_CLOCK_HZ (1000 * 1000)
 #define AKITA_TRANSPORT_LORA_TX_TIMEOUT_MS 5000
@@ -48,7 +57,9 @@
 #define AKITA_LORA_REG_FIFO_ADDR_PTR 0x0D
 #define AKITA_LORA_REG_FIFO_TX_BASE_ADDR 0x0E
 #define AKITA_LORA_REG_FIFO_RX_BASE_ADDR 0x0F
+#define AKITA_LORA_REG_FIFO_RX_CURRENT_ADDR 0x10
 #define AKITA_LORA_REG_IRQ_FLAGS 0x12
+#define AKITA_LORA_REG_RX_NB_BYTES 0x13
 #define AKITA_LORA_REG_MODEM_CONFIG_1 0x1D
 #define AKITA_LORA_REG_MODEM_CONFIG_2 0x1E
 #define AKITA_LORA_REG_PREAMBLE_MSB 0x20
@@ -66,11 +77,14 @@
 #define AKITA_LORA_MODE_SLEEP 0x00
 #define AKITA_LORA_MODE_STDBY 0x01
 #define AKITA_LORA_MODE_TX 0x03
+#define AKITA_LORA_MODE_RX_CONTINUOUS 0x05
 
 #define AKITA_LORA_PA_BOOST 0x80
 #define AKITA_LORA_PA_DAC_ENABLE 0x07
 #define AKITA_LORA_PA_DAC_DISABLE 0x04
 #define AKITA_LORA_IRQ_TX_DONE 0x08
+#define AKITA_LORA_IRQ_RX_DONE 0x40
+#define AKITA_LORA_IRQ_PAYLOAD_CRC_ERROR 0x20
 #define AKITA_LORA_EXPECTED_VERSION 0x12
 
 static const char *TAG = "akita_transport";
@@ -99,6 +113,11 @@ static akita_transport_mode_t g_transport_mode;
 static akita_transport_endpoint_t g_endpoint_type;
 static char g_rns_bridge_mode[AKITA_TRANSPORT_BRIDGE_MODE_MAX_LEN] = "inactive";
 static char g_rns_bridge_last_error[AKITA_TRANSPORT_BRIDGE_ERROR_MAX_LEN];
+static SemaphoreHandle_t g_transport_lock;
+static uint32_t g_wifi_backoff_ms = AKITA_TRANSPORT_WIFI_RETRY_MIN_MS;
+static uint64_t g_wifi_retry_at_ms;
+static uint64_t g_rns_next_ping_ms;
+static int8_t g_wifi_rssi;
 
 static void akita_transport_copy_string(char *destination, size_t destination_size, const char *source) {
     if (destination == NULL || destination_size == 0U) {
@@ -106,6 +125,25 @@ static void akita_transport_copy_string(char *destination, size_t destination_si
     }
 
     snprintf(destination, destination_size, "%s", source != NULL ? source : "");
+}
+
+static uint64_t akita_transport_now_ms(void) {
+    return (uint64_t) (esp_timer_get_time() / 1000ULL);
+}
+
+static void akita_transport_lock(void) {
+    if (g_transport_lock == NULL) {
+        g_transport_lock = xSemaphoreCreateMutex();
+    }
+    if (g_transport_lock != NULL) {
+        xSemaphoreTake(g_transport_lock, portMAX_DELAY);
+    }
+}
+
+static void akita_transport_unlock(void) {
+    if (g_transport_lock != NULL) {
+        xSemaphoreGive(g_transport_lock);
+    }
 }
 
 static void akita_transport_update_ready_state(void) {
@@ -150,11 +188,6 @@ static void akita_transport_disable_wifi_uplink(void) {
     if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_MODE) {
         ESP_LOGW(TAG, "WiFi uplink disconnect failed: %s", esp_err_to_name(err));
     }
-}
-
-static void akita_transport_set_rns_bridge_ready(bool ready) {
-    g_rns_bridge_ready = ready;
-    akita_transport_update_ready_state();
 }
 
 static void akita_transport_set_rns_bridge_state(bool ready, const char *mode, const char *last_error) {
@@ -239,6 +272,25 @@ static esp_err_t akita_transport_lora_transfer(
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (byte_count <= 4U) {
+        size_t index;
+        transaction.flags = SPI_TRANS_USE_TXDATA;
+        if (rx_data != NULL) {
+            transaction.flags |= SPI_TRANS_USE_RXDATA;
+        }
+        transaction.length = byte_count * 8U;
+        for (index = 0; index < byte_count; ++index) {
+            transaction.tx_data[index] = tx_data[index];
+        }
+        esp_err_t err = spi_device_polling_transmit(g_lora_spi, &transaction);
+        if (err == ESP_OK && rx_data != NULL) {
+            for (index = 0; index < byte_count; ++index) {
+                rx_data[index] = transaction.rx_data[index];
+            }
+        }
+        return err;
+    }
+
     transaction.length = byte_count * 8U;
     transaction.tx_buffer = tx_data;
     transaction.rx_buffer = rx_data;
@@ -276,7 +328,7 @@ static esp_err_t akita_transport_lora_write_fifo(const uint8_t *payload, size_t 
         return ESP_ERR_INVALID_ARG;
     }
 
-    buffer = malloc(payload_len + 1U);
+    buffer = heap_caps_malloc(payload_len + 1U, MALLOC_CAP_DMA);
     if (buffer == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -284,8 +336,94 @@ static esp_err_t akita_transport_lora_write_fifo(const uint8_t *payload, size_t 
     buffer[0] = (uint8_t) (AKITA_LORA_REG_FIFO | 0x80U);
     memcpy(buffer + 1U, payload, payload_len);
     err = akita_transport_lora_transfer(buffer, NULL, payload_len + 1U);
-    free(buffer);
+    heap_caps_free(buffer);
     return err;
+}
+
+static esp_err_t akita_transport_lora_read_fifo(uint8_t *payload, size_t payload_len) {
+    uint8_t *tx_buffer;
+    uint8_t *rx_buffer;
+    esp_err_t err;
+
+    if (payload == NULL || payload_len == 0U || payload_len > AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    tx_buffer = heap_caps_calloc(payload_len + 1U, 1U, MALLOC_CAP_DMA);
+    rx_buffer = heap_caps_calloc(payload_len + 1U, 1U, MALLOC_CAP_DMA);
+    if (tx_buffer == NULL || rx_buffer == NULL) {
+        heap_caps_free(tx_buffer);
+        heap_caps_free(rx_buffer);
+        return ESP_ERR_NO_MEM;
+    }
+
+    tx_buffer[0] = (uint8_t) (AKITA_LORA_REG_FIFO & 0x7FU);
+    err = akita_transport_lora_transfer(tx_buffer, rx_buffer, payload_len + 1U);
+    if (err == ESP_OK) {
+        memcpy(payload, rx_buffer + 1U, payload_len);
+    }
+
+    heap_caps_free(tx_buffer);
+    heap_caps_free(rx_buffer);
+    return err;
+}
+
+static esp_err_t akita_transport_lora_enter_rx(void) {
+    ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, 0xFF), TAG, "LoRa IRQ clear before RX failed");
+    ESP_RETURN_ON_ERROR(
+        akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_RX_CONTINUOUS),
+        TAG,
+        "LoRa RX continuous mode failed"
+    );
+    return ESP_OK;
+}
+
+static void akita_transport_lora_harvest_rx(void) {
+    uint8_t irq_flags = 0;
+    uint8_t current_addr = 0;
+    uint8_t byte_count = 0;
+    uint8_t payload[AKITA_TRANSPORT_LORA_MAX_PAYLOAD_LEN + 1U];
+    esp_err_t err;
+
+    if (!g_lora_ready || g_lora_spi == NULL) {
+        return;
+    }
+
+    err = akita_transport_lora_read_register(AKITA_LORA_REG_IRQ_FLAGS, &irq_flags);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    if ((irq_flags & AKITA_LORA_IRQ_PAYLOAD_CRC_ERROR) != 0U) {
+        ESP_LOGW(TAG, "Dropping LoRa frame with CRC error");
+        (void) akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, irq_flags);
+        return;
+    }
+
+    if ((irq_flags & AKITA_LORA_IRQ_RX_DONE) == 0U) {
+        return;
+    }
+
+    err = akita_transport_lora_read_register(AKITA_LORA_REG_FIFO_RX_CURRENT_ADDR, &current_addr);
+    if (err == ESP_OK) {
+        err = akita_transport_lora_read_register(AKITA_LORA_REG_RX_NB_BYTES, &byte_count);
+    }
+    if (err != ESP_OK || byte_count == 0U) {
+        (void) akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, irq_flags);
+        return;
+    }
+
+    err = akita_transport_lora_write_register(AKITA_LORA_REG_FIFO_ADDR_PTR, current_addr);
+    if (err == ESP_OK) {
+        err = akita_transport_lora_read_fifo(payload, byte_count);
+    }
+    (void) akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, irq_flags);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    payload[byte_count] = '\0';
+    ESP_LOGI(TAG, "LoRa received %u bytes: %s", (unsigned) byte_count, (const char *) payload);
 }
 
 static esp_err_t akita_transport_lora_reset(const akita_runtime_config_t *config) {
@@ -382,6 +520,12 @@ static esp_err_t akita_transport_configure_lora(const akita_runtime_config_t *co
         return err;
     }
 
+    if (version == 0x00U || version == 0xFFU) {
+        ESP_LOGE(TAG, "No SX127x radio detected (version 0x%02x)", version);
+        akita_transport_disable_lora_uplink();
+        return ESP_ERR_NOT_FOUND;
+    }
+
     if (version != AKITA_LORA_EXPECTED_VERSION) {
         ESP_LOGW(TAG, "Unexpected SX127x version 0x%02x while configuring LoRa transport", version);
     }
@@ -405,6 +549,7 @@ static esp_err_t akita_transport_configure_lora(const akita_runtime_config_t *co
     ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_PA_DAC, AKITA_LORA_PA_DAC_DISABLE), fail, TAG, "LoRa PA DAC failed");
     ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, 0xFF), fail, TAG, "LoRa IRQ clear failed");
     ESP_GOTO_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY), fail, TAG, "LoRa standby mode failed");
+    ESP_GOTO_ON_ERROR(akita_transport_lora_enter_rx(), fail, TAG, "LoRa RX mode failed");
 
     g_endpoint_type = AKITA_TRANSPORT_ENDPOINT_LORA;
     g_lora_ready = true;
@@ -454,14 +599,14 @@ static esp_err_t akita_transport_publish_lora(const char *payload) {
 
         if ((irq_flags & AKITA_LORA_IRQ_TX_DONE) != 0U) {
             ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_IRQ_FLAGS, irq_flags), TAG, "LoRa IRQ clear after TX failed");
-            ESP_RETURN_ON_ERROR(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY), TAG, "LoRa standby after TX failed");
+            ESP_RETURN_ON_ERROR(akita_transport_lora_enter_rx(), TAG, "LoRa RX after TX failed");
             return ESP_OK;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    ESP_ERROR_CHECK_WITHOUT_ABORT(akita_transport_lora_write_register(AKITA_LORA_REG_OP_MODE, AKITA_LORA_MODE_LONG_RANGE | AKITA_LORA_MODE_STDBY));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(akita_transport_lora_enter_rx());
     return ESP_ERR_TIMEOUT;
 }
 
@@ -474,7 +619,7 @@ static akita_transport_endpoint_t akita_transport_endpoint_type(const char *endp
         return AKITA_TRANSPORT_ENDPOINT_RNS_UDP;
     }
 
-    if (strncasecmp(endpoint, "http://", 7) == 0) {
+    if (strncasecmp(endpoint, "http://", 7) == 0 || strncasecmp(endpoint, "https://", 8) == 0) {
         return AKITA_TRANSPORT_ENDPOINT_HTTP;
     }
 
@@ -521,8 +666,6 @@ static void akita_transport_wifi_event_handler(
     int32_t event_id,
     void *event_data
 ) {
-    esp_err_t err;
-
     (void) arg;
     (void) event_data;
 
@@ -537,9 +680,12 @@ static void akita_transport_wifi_event_handler(
         akita_transport_update_ready_state();
 
         if (g_wifi_transport_enabled) {
-            err = esp_wifi_connect();
-            if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
-                ESP_LOGW(TAG, "WiFi reconnect attempt failed: %s", esp_err_to_name(err));
+            g_wifi_retry_at_ms = akita_transport_now_ms() + g_wifi_backoff_ms;
+            if (g_wifi_backoff_ms < AKITA_TRANSPORT_WIFI_RETRY_MAX_MS) {
+                g_wifi_backoff_ms = g_wifi_backoff_ms * 2U;
+                if (g_wifi_backoff_ms > AKITA_TRANSPORT_WIFI_RETRY_MAX_MS) {
+                    g_wifi_backoff_ms = AKITA_TRANSPORT_WIFI_RETRY_MAX_MS;
+                }
             }
         }
         return;
@@ -547,6 +693,9 @@ static void akita_transport_wifi_event_handler(
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         g_wifi_connected = true;
+        g_wifi_backoff_ms = AKITA_TRANSPORT_WIFI_RETRY_MIN_MS;
+        g_wifi_retry_at_ms = 0;
+        g_rns_next_ping_ms = 0;
         if (g_wifi_event_group != NULL) {
             xEventGroupSetBits(g_wifi_event_group, AKITA_TRANSPORT_WIFI_CONNECTED_BIT);
         }
@@ -729,6 +878,9 @@ static esp_err_t akita_transport_configure_wifi(const akita_runtime_config_t *co
     }
 
     g_wifi_transport_enabled = true;
+    g_wifi_backoff_ms = AKITA_TRANSPORT_WIFI_RETRY_MIN_MS;
+    g_wifi_retry_at_ms = 0;
+    g_rns_next_ping_ms = 0;
     akita_transport_update_ready_state();
     ESP_LOGI(TAG, "WiFi transport configured for %s", config->telemetry_endpoint);
     return ESP_OK;
@@ -740,6 +892,12 @@ static esp_err_t akita_transport_publish_http(const char *endpoint, const char *
         .method = HTTP_METHOD_POST,
         .timeout_ms = AKITA_TRANSPORT_HTTP_TIMEOUT_MS,
     };
+
+#if defined(AKITA_TRANSPORT_HAS_CRT_BUNDLE)
+    if (strncasecmp(endpoint, "https://", 8) == 0) {
+        client_config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+#endif
     esp_http_client_handle_t client;
     esp_err_t err;
     int status_code;
@@ -1207,16 +1365,56 @@ bool akita_transport_ready(void) {
     return g_transport_ready;
 }
 
+void akita_transport_poll(const akita_runtime_config_t *config) {
+    uint64_t now_ms = akita_transport_now_ms();
+    wifi_ap_record_t ap_info;
+    esp_err_t err;
+
+    if (g_lora_ready) {
+        akita_transport_lora_harvest_rx();
+    }
+
+    if (g_wifi_transport_enabled && !g_wifi_connected && g_wifi_retry_at_ms > 0U && now_ms >= g_wifi_retry_at_ms) {
+        g_wifi_retry_at_ms = now_ms + g_wifi_backoff_ms;
+        err = esp_wifi_connect();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_STATE && err != ESP_ERR_WIFI_CONN) {
+            ESP_LOGW(TAG, "WiFi reconnect attempt failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    if (g_wifi_connected && esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        g_wifi_rssi = ap_info.rssi;
+    } else if (!g_wifi_connected) {
+        g_wifi_rssi = 0;
+    }
+
+    if (config != NULL &&
+        config->transport_mode == AKITA_TRANSPORT_WIFI &&
+        g_endpoint_type == AKITA_TRANSPORT_ENDPOINT_RNS_UDP &&
+        g_wifi_transport_enabled &&
+        g_wifi_connected &&
+        now_ms >= g_rns_next_ping_ms) {
+        err = akita_transport_ping_rns_bridge(config);
+        g_rns_next_ping_ms = now_ms + (err == ESP_OK ? (AKITA_TRANSPORT_RNS_PING_INTERVAL_MS * 3U)
+                                                    : AKITA_TRANSPORT_RNS_PING_INTERVAL_MS);
+    }
+}
+
 void akita_transport_get_status(akita_transport_status_t *status) {
     if (status == NULL) {
         return;
     }
 
+    akita_transport_lock();
     memset(status, 0, sizeof(*status));
     status->transport_ready = g_transport_ready;
     status->bridge_ready = g_rns_bridge_ready;
+    status->lora_ready = g_lora_ready;
+    status->wifi_connected = g_wifi_connected;
+    status->wifi_rssi = g_wifi_rssi;
     akita_transport_copy_string(status->bridge_mode, sizeof(status->bridge_mode), g_rns_bridge_mode);
     akita_transport_copy_string(status->bridge_last_error, sizeof(status->bridge_last_error), g_rns_bridge_last_error);
+    akita_transport_unlock();
 }
 
 const char *akita_transport_name(const akita_runtime_config_t *config) {

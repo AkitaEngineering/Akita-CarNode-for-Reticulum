@@ -1,5 +1,6 @@
 #include "akita_gps.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 static const char *TAG = "akita_gps";
 static bool g_gps_ready;
 static bool g_uart_driver_ready;
+static bool g_sentence_overflow;
 static uart_port_t g_uart_port;
 static char g_sentence[128];
 static size_t g_sentence_len;
@@ -36,6 +38,7 @@ static void akita_gps_reset_parser_state(void) {
     memset(&g_latest_fix, 0, sizeof(g_latest_fix));
     memset(g_sentence, 0, sizeof(g_sentence));
     g_sentence_len = 0;
+    g_sentence_overflow = false;
     g_last_fix_ms = 0;
 }
 
@@ -54,11 +57,51 @@ static void akita_gps_stop_locked(void) {
     akita_gps_reset_parser_state();
 }
 
+static bool akita_nmea_checksum_ok(const char *sentence) {
+    const char *star;
+    unsigned expected;
+    unsigned calculated = 0;
+    const char *cursor;
+
+    if (sentence == NULL || sentence[0] != '$') {
+        return false;
+    }
+
+    star = strrchr(sentence, '*');
+    if (star == NULL || !isxdigit((unsigned char) star[1]) || !isxdigit((unsigned char) star[2])) {
+        return true;
+    }
+
+    expected = (unsigned) strtoul(star + 1, NULL, 16);
+    for (cursor = sentence + 1; cursor < star; ++cursor) {
+        calculated ^= (unsigned char) *cursor;
+    }
+
+    return calculated == expected;
+}
+
+static bool akita_nmea_is_type(const char *sentence, const char *type) {
+    return sentence != NULL &&
+           type != NULL &&
+           sentence[0] == '$' &&
+           strlen(sentence) >= 6U &&
+           strncmp(sentence + 3, type, 3) == 0;
+}
+
 static float akita_nmea_to_decimal(const char *text, char hemisphere) {
-    double raw = atof(text);
-    int degrees = (int) (raw / 100.0);
-    double minutes = raw - ((double) degrees * 100.0);
-    double decimal = (double) degrees + (minutes / 60.0);
+    double raw;
+    int degrees;
+    double minutes;
+    double decimal;
+
+    if (text == NULL || text[0] == '\0') {
+        return 0.0f;
+    }
+
+    raw = atof(text);
+    degrees = (int) (raw / 100.0);
+    minutes = raw - ((double) degrees * 100.0);
+    decimal = (double) degrees + (minutes / 60.0);
 
     if (hemisphere == 'S' || hemisphere == 'W') {
         decimal = -decimal;
@@ -91,11 +134,11 @@ static void akita_gps_parse_gga(char *sentence) {
     char *tokens[16] = { 0 };
     size_t count = akita_split_csv(sentence, tokens, 16);
 
-    if (count < 10) {
+    if (count < 10 || tokens[2][0] == '\0' || tokens[4][0] == '\0') {
         return;
     }
 
-    if (tokens[6][0] == '0') {
+    if (tokens[6][0] == '0' || tokens[6][0] == '\0') {
         g_latest_fix.fix = false;
         return;
     }
@@ -112,7 +155,7 @@ static void akita_gps_parse_rmc(char *sentence) {
     char *tokens[16] = { 0 };
     size_t count = akita_split_csv(sentence, tokens, 16);
 
-    if (count < 8) {
+    if (count < 8 || tokens[3][0] == '\0' || tokens[5][0] == '\0') {
         return;
     }
 
@@ -129,15 +172,20 @@ static void akita_gps_parse_rmc(char *sentence) {
 }
 
 static void akita_gps_process_sentence(char *sentence) {
-    if (strncmp(sentence, "$GPGGA", 6) == 0 || strncmp(sentence, "$GNGGA", 6) == 0) {
+    if (!akita_nmea_checksum_ok(sentence)) {
+        return;
+    }
+
+    if (akita_nmea_is_type(sentence, "GGA")) {
         akita_gps_parse_gga(sentence);
-    } else if (strncmp(sentence, "$GPRMC", 6) == 0 || strncmp(sentence, "$GNRMC", 6) == 0) {
+    } else if (akita_nmea_is_type(sentence, "RMC")) {
         akita_gps_parse_rmc(sentence);
     }
 }
 
 esp_err_t akita_gps_init(const akita_runtime_config_t *config) {
-    uart_config_t uart_config;
+    uart_config_t uart_config = { 0 };
+    int tx_pin;
     esp_err_t err;
 
     if (config == NULL) {
@@ -152,12 +200,13 @@ esp_err_t akita_gps_init(const akita_runtime_config_t *config) {
     xSemaphoreTake(g_gps_lock, portMAX_DELAY);
     akita_gps_stop_locked();
 
-    if (!config->enable_gps || config->gps_rx_pin < 0 || config->gps_tx_pin < 0) {
+    if (!config->enable_gps || config->gps_rx_pin < 0) {
         xSemaphoreGive(g_gps_lock);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     g_uart_port = (uart_port_t) config->gps_uart_port;
+    tx_pin = config->gps_tx_pin >= 0 ? config->gps_tx_pin : UART_PIN_NO_CHANGE;
     uart_config.baud_rate = (int) config->gps_uart_baud;
     uart_config.data_bits = UART_DATA_8_BITS;
     uart_config.parity = UART_PARITY_DISABLE;
@@ -175,7 +224,7 @@ esp_err_t akita_gps_init(const akita_runtime_config_t *config) {
     g_uart_driver_ready = true;
     err = uart_param_config(g_uart_port, &uart_config);
     if (err == ESP_OK) {
-        err = uart_set_pin(g_uart_port, config->gps_tx_pin, config->gps_rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+        err = uart_set_pin(g_uart_port, tx_pin, config->gps_rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     }
 
     if (err != ESP_OK) {
@@ -185,7 +234,13 @@ esp_err_t akita_gps_init(const akita_runtime_config_t *config) {
     }
 
     g_gps_ready = true;
-    ESP_LOGI(TAG, "GPS UART ready on port %ld RX=%ld TX=%ld", (long) config->gps_uart_port, (long) config->gps_rx_pin, (long) config->gps_tx_pin);
+    ESP_LOGI(
+        TAG,
+        "GPS UART ready on port %ld RX=%ld TX=%ld",
+        (long) config->gps_uart_port,
+        (long) config->gps_rx_pin,
+        (long) config->gps_tx_pin
+    );
     xSemaphoreGive(g_gps_lock);
     return ESP_OK;
 }
@@ -216,21 +271,32 @@ void akita_gps_poll(akita_gps_snapshot_t *snapshot) {
     }
 
     bytes_read = uart_read_bytes(g_uart_port, rx_buffer, sizeof(rx_buffer), 0);
+    if (bytes_read < 0) {
+        *snapshot = g_latest_fix;
+        xSemaphoreGive(g_gps_lock);
+        return;
+    }
+
     for (index = 0; index < bytes_read; ++index) {
         char current = (char) rx_buffer[index];
         if (current == '\n') {
             g_sentence[g_sentence_len] = '\0';
-            if (g_sentence_len > 6) {
+            if (!g_sentence_overflow && g_sentence_len > 6) {
                 akita_gps_process_sentence(g_sentence);
             }
             g_sentence_len = 0;
-        } else if (current != '\r' && g_sentence_len < (sizeof(g_sentence) - 1)) {
-            g_sentence[g_sentence_len++] = current;
+            g_sentence_overflow = false;
+        } else if (current != '\r') {
+            if (g_sentence_len < (sizeof(g_sentence) - 1)) {
+                g_sentence[g_sentence_len++] = current;
+            } else {
+                g_sentence_overflow = true;
+            }
         }
     }
 
     now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
-    if (g_latest_fix.fix) {
+    if (g_latest_fix.fix && g_last_fix_ms > 0U) {
         g_latest_fix.age_ms = (uint32_t) (now_ms - g_last_fix_ms);
     }
 

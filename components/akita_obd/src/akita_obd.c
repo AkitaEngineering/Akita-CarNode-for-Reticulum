@@ -9,6 +9,8 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
@@ -24,10 +26,11 @@
 #define AKITA_OBD_RX_BUFFER_SIZE 256U
 #define AKITA_OBD_CONN_HANDLE_NONE UINT16_MAX
 #define AKITA_OBD_CONNECT_TIMEOUT_MS 30000
-#define AKITA_OBD_RESPONSE_TIMEOUT_MS 1500U
+#define AKITA_OBD_RESPONSE_TIMEOUT_MS 4000U
 #define AKITA_OBD_INIT_DELAY_MS 250U
 #define AKITA_OBD_PID_DELAY_MS 125U
 #define AKITA_OBD_READ_DELAY_MS 80U
+#define AKITA_OBD_MAX_COMMAND_RETRIES 3U
 
 static const char *TAG = "akita_obd";
 
@@ -91,6 +94,8 @@ static char g_target_service_uuid[AKITA_UUID_STRING_LENGTH];
 static char g_target_characteristic_uuid[AKITA_UUID_STRING_LENGTH];
 static char g_rx_buffer[AKITA_OBD_RX_BUFFER_SIZE];
 static size_t g_rx_length;
+static uint8_t g_command_retries;
+static SemaphoreHandle_t g_obd_lock;
 
 static void akita_obd_host_task(void *param);
 static int akita_obd_gap_event(struct ble_gap_event *event, void *arg);
@@ -110,6 +115,53 @@ static int akita_obd_on_read_complete(uint16_t conn_handle, const struct ble_gat
 
 static uint64_t akita_now_ms(void) {
     return (uint64_t) (esp_timer_get_time() / 1000ULL);
+}
+
+static void akita_obd_lock(void) {
+    if (g_obd_lock == NULL) {
+        g_obd_lock = xSemaphoreCreateMutex();
+    }
+    if (g_obd_lock != NULL) {
+        xSemaphoreTake(g_obd_lock, portMAX_DELAY);
+    }
+}
+
+static void akita_obd_unlock(void) {
+    if (g_obd_lock != NULL) {
+        xSemaphoreGive(g_obd_lock);
+    }
+}
+
+static bool akita_text_contains_ci(const char *haystack, const char *needle) {
+    size_t haystack_len;
+    size_t needle_len;
+    size_t index;
+
+    if (haystack == NULL || needle == NULL || needle[0] == '\0') {
+        return false;
+    }
+
+    haystack_len = strlen(haystack);
+    needle_len = strlen(needle);
+    if (needle_len > haystack_len) {
+        return false;
+    }
+
+    for (index = 0; index <= (haystack_len - needle_len); ++index) {
+        size_t offset;
+        bool matched = true;
+        for (offset = 0; offset < needle_len; ++offset) {
+            if (tolower((unsigned char) haystack[index + offset]) != tolower((unsigned char) needle[offset])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static void akita_clear_response_buffer(void) {
@@ -158,6 +210,7 @@ static void akita_reset_link_state(void) {
     g_next_command_at_ms = 0;
     g_command_started_ms = 0;
     g_read_due_ms = 0;
+    g_command_retries = 0;
     g_obd_state.connected = false;
     akita_clear_response_buffer();
 }
@@ -385,7 +438,7 @@ static bool akita_should_connect(const struct ble_gap_disc_desc *disc) {
         return name_match || uuid_match;
     }
 
-    return true;
+    return false;
 }
 
 static const char *akita_current_command(void) {
@@ -423,6 +476,7 @@ static void akita_complete_pending_command(void) {
     g_read_in_flight = false;
     g_read_due_ms = 0;
     g_command_started_ms = 0;
+    g_command_retries = 0;
     akita_clear_response_buffer();
     g_next_command_at_ms = akita_now_ms() + (init_phase ? AKITA_OBD_INIT_DELAY_MS : AKITA_OBD_PID_DELAY_MS);
 }
@@ -448,6 +502,12 @@ static void akita_process_response_text(const char *text, size_t length, bool fo
         parsed = akita_obd_apply_response(&g_obd_state, g_rx_buffer);
         if (strchr(g_rx_buffer, '>') != NULL) {
             has_prompt = true;
+        }
+        if (akita_text_contains_ci(g_rx_buffer, "NO DATA") ||
+            akita_text_contains_ci(g_rx_buffer, "UNABLE") ||
+            akita_text_contains_ci(g_rx_buffer, "STOPPED") ||
+            strchr(g_rx_buffer, '?') != NULL) {
+            force_complete = true;
         }
     }
 
@@ -998,8 +1058,14 @@ void akita_obd_poll(akita_obd_snapshot_t *snapshot) {
 
     if (g_pending_response && g_command_started_ms > 0U &&
         (now_ms - g_command_started_ms) >= AKITA_OBD_RESPONSE_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "Timed out waiting for OBD response");
-        akita_complete_pending_command();
+        bool init_phase = g_init_command_index < AKITA_ARRAY_LEN(kInitCommands);
+        ESP_LOGW(TAG, "Timed out waiting for OBD response to %s", akita_current_command());
+        if (!init_phase && g_command_retries < AKITA_OBD_MAX_COMMAND_RETRIES) {
+            ++g_command_retries;
+            akita_schedule_retry(250U);
+        } else {
+            akita_complete_pending_command();
+        }
     }
 
     if (g_pending_response && g_use_read_fallback && !g_read_in_flight && g_read_due_ms > 0U && now_ms >= g_read_due_ms) {
@@ -1047,16 +1113,25 @@ void akita_obd_poll(akita_obd_snapshot_t *snapshot) {
         g_obd_state.age_ms = (uint32_t) (now_ms - g_last_sample_ms);
     }
 
+    akita_obd_lock();
     g_obd_state.connected = g_conn_handle != AKITA_OBD_CONN_HANDLE_NONE;
     *snapshot = g_obd_state;
+    akita_obd_unlock();
 }
 
 size_t akita_obd_build_request(const char *pid, char *buffer, size_t buffer_size) {
+    int written;
+
     if (buffer == NULL || buffer_size == 0 || pid == NULL) {
         return 0;
     }
 
-    return (size_t) snprintf(buffer, buffer_size, "%s\r", pid);
+    written = snprintf(buffer, buffer_size, "%s\r", pid);
+    if (written < 0 || (size_t) written >= buffer_size) {
+        return 0;
+    }
+
+    return (size_t) written;
 }
 
 bool akita_obd_apply_response(akita_obd_snapshot_t *snapshot, const char *response) {
@@ -1095,7 +1170,9 @@ bool akita_obd_apply_response(akita_obd_snapshot_t *snapshot, const char *respon
     }
 
     snapshot->connected = g_conn_handle != AKITA_OBD_CONN_HANDLE_NONE;
+    akita_obd_lock();
     g_obd_state = *snapshot;
     g_last_sample_ms = akita_now_ms();
+    akita_obd_unlock();
     return true;
 }

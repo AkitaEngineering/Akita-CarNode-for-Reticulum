@@ -27,6 +27,8 @@ config AKITA_CONFIG_PORTAL_SSID
 
 config AKITA_CONFIG_PORTAL_PASSWORD
     string "Config portal password"
-    default ""
+    default "akita-setup"
+    help
+        WPA2 requires 8 to 63 characters. Leave empty only if you intentionally want an open setup AP.
 
 endmenu

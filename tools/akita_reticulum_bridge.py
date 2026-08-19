@@ -43,6 +43,7 @@ class AkitaReticulumBridge:
         delivery_backoff_seconds: float,
         delivery_backoff_factor: float,
         delivery_backoff_max: float,
+        delivery_deadline_seconds: float,
     ):
         self.rns = rns
         self.reticulum = rns.Reticulum(config_path)
@@ -54,6 +55,7 @@ class AkitaReticulumBridge:
         self.delivery_backoff_seconds = max(0.0, delivery_backoff_seconds)
         self.delivery_backoff_factor = max(1.0, delivery_backoff_factor)
         self.delivery_backoff_max = max(self.delivery_backoff_seconds, delivery_backoff_max)
+        self.delivery_deadline_seconds = max(0.5, delivery_deadline_seconds)
         self.destination_hex_length = (rns.Reticulum.TRUNCATED_HASHLENGTH // 8) * 2
         self.broadcast_destination = rns.Destination(
             None,
@@ -122,8 +124,15 @@ class AkitaReticulumBridge:
     def deliver_directed(self, destination_hash: str, payload: bytes):
         backoff = self.delivery_backoff_seconds
         last_error = None
+        deadline = time.time() + self.delivery_deadline_seconds
 
         for attempt in range(1, self.delivery_attempts + 1):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            previous_path_timeout = self.path_timeout
+            self.path_timeout = min(self.path_timeout, max(0.0, remaining - 0.25))
             try:
                 destination = self.resolve_outbound_destination(destination_hash)
                 receipt = self.rns.Packet(destination, payload).send()
@@ -135,14 +144,21 @@ class AkitaReticulumBridge:
                 if attempt >= self.delivery_attempts:
                     break
 
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+
+                sleep_for = min(backoff, remaining)
                 self.log(
-                    f"Directed delivery attempt {attempt}/{self.delivery_attempts} failed for {destination_hash}: {exc}. Retrying in {backoff:.2f} seconds",
+                    f"Directed delivery attempt {attempt}/{self.delivery_attempts} failed for {destination_hash}: {exc}. Retrying in {sleep_for:.2f} seconds",
                     self.rns.LOG_INFO,
                 )
                 self.rns.Transport.request_path(bytes.fromhex(destination_hash))
-                if backoff > 0:
-                    time.sleep(backoff)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
                 backoff = min(self.delivery_backoff_max, backoff * self.delivery_backoff_factor)
+            finally:
+                self.path_timeout = previous_path_timeout
 
         raise RuntimeError(
             f"Directed delivery failed after {self.delivery_attempts} attempts: {last_error}"
@@ -274,6 +290,12 @@ def main() -> int:
         default=4.0,
         help="Maximum backoff in seconds between directed delivery retries",
     )
+    parser.add_argument(
+        "--delivery-deadline-seconds",
+        type=float,
+        default=8.0,
+        help="Maximum seconds spent on directed delivery before returning an error to the firmware",
+    )
     args = parser.parse_args()
 
     try:
@@ -293,6 +315,7 @@ def main() -> int:
         delivery_backoff_seconds=args.delivery_backoff_seconds,
         delivery_backoff_factor=args.delivery_backoff_factor,
         delivery_backoff_max=args.delivery_backoff_max,
+        delivery_deadline_seconds=args.delivery_deadline_seconds,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -315,6 +338,8 @@ def main() -> int:
         try:
             data, address = sock.recvfrom(4096)
             envelope = json.loads(data.decode("utf-8"))
+            if not isinstance(envelope, dict):
+                raise ValueError("Bridge envelope must be a JSON object")
             response = bridge.handle_envelope(envelope)
             sock.sendto(json.dumps(response, separators=(",", ":")).encode("utf-8"), address)
         except KeyboardInterrupt:

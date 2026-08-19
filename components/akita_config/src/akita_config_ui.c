@@ -70,10 +70,11 @@ static const char kConfigPage[] =
 "        <section class=\"panel\">\n"
 "          <h2>Uplink</h2>\n"
 "          <label>Transport<select name=\"transport_mode\"><option value=\"wifi\">WiFi uplink</option><option value=\"lora\">LoRa uplink</option><option value=\"none\">Local only</option></select></label>\n"
-"          <label>WiFi SSID<input name=\"wifi_ssid\" maxlength=\"63\"></label>\n"
-"          <label>WiFi password<input name=\"wifi_password\" type=\"password\" maxlength=\"63\"></label>\n"
-"          <label>Telemetry endpoint<input name=\"telemetry_endpoint\" maxlength=\"95\" placeholder=\"http://host/path, udp://host:port, rns+udp://host:port\"></label>\n"
+"          <label>WiFi SSID<input name=\"wifi_ssid\" maxlength=\"32\"></label>\n"
+"          <label>WiFi password<input name=\"wifi_password\" type=\"password\" maxlength=\"63\" placeholder=\"leave blank to keep current password\"></label>\n"
+"          <label>Telemetry endpoint<input name=\"telemetry_endpoint\" maxlength=\"95\" placeholder=\"http(s)://host/path, udp://host:port, rns+udp://host:port\"></label>\n"
 "          <label>Reticulum destination<input name=\"reticulum_destination\" maxlength=\"63\" placeholder=\"32 hex chars, or leave empty to broadcast\"></label>\n"
+"          <label>LoRa frequency (Hz)<input name=\"lora_frequency_hz\" type=\"number\" min=\"137000000\" max=\"1020000000\"></label>\n"
 "        </section>\n"
 "        <section class=\"panel\">\n"
 "          <h2>Vehicle I/O</h2>\n"
@@ -89,6 +90,9 @@ static const char kConfigPage[] =
 "        <section class=\"panel\">\n"
 "          <h2>Runtime Status</h2>\n"
 "          <label>Transport ready<input name=\"transport_status_ready\" disabled></label>\n"
+"          <label>WiFi uplink<input name=\"wifi_status_connected\" disabled></label>\n"
+"          <label>WiFi RSSI<input name=\"wifi_status_rssi\" disabled></label>\n"
+"          <label>LoRa radio ready<input name=\"lora_status_ready\" disabled></label>\n"
 "          <label>Reticulum bridge ready<input name=\"bridge_status_ready\" disabled></label>\n"
 "          <label>Reticulum bridge mode<input name=\"bridge_status_mode\" disabled></label>\n"
 "          <label>Reticulum last error<input name=\"bridge_status_error\" disabled></label>\n"
@@ -98,7 +102,7 @@ static const char kConfigPage[] =
 "        <button type=\"submit\">Save configuration</button>\n"
 "        <div id=\"status\"></div>\n"
 "      </div>\n"
-"      <div class=\"note\">This portal is intentionally small and self-contained so it stays predictable on ESP32-C5, ESP32-C6, ESP32-S3 and Heltec-class LoRa boards.</div>\n"
+"      <div class=\"note\">Leave the WiFi password blank to keep the currently stored password. This portal is self-contained so it stays predictable on ESP32, ESP32-C5, ESP32-C6, ESP32-S3 and Heltec-class LoRa boards.</div>\n"
 "    </form>\n"
 "  </div>\n"
 "  <script>\n"
@@ -113,11 +117,17 @@ static const char kConfigPage[] =
 "    function refreshStatus() {\n"
 "      fetch('/api/status').then(r => r.json()).then(data => {\n"
 "        setFieldValue('transport_status_ready', data.transport_ready ? 'yes' : 'no');\n"
+"        setFieldValue('wifi_status_connected', data.wifi_connected ? 'yes' : 'no');\n"
+"        setFieldValue('wifi_status_rssi', (data.wifi_rssi === undefined || data.wifi_rssi === null) ? '' : String(data.wifi_rssi));\n"
+"        setFieldValue('lora_status_ready', data.lora_ready ? 'yes' : 'no');\n"
 "        setFieldValue('bridge_status_ready', data.bridge_ready ? 'yes' : 'no');\n"
 "        setFieldValue('bridge_status_mode', data.bridge_mode || 'inactive');\n"
 "        setFieldValue('bridge_status_error', data.bridge_last_error || '');\n"
 "      }).catch(() => {\n"
 "        setFieldValue('transport_status_ready', 'unknown');\n"
+"        setFieldValue('wifi_status_connected', 'unknown');\n"
+"        setFieldValue('wifi_status_rssi', 'unknown');\n"
+"        setFieldValue('lora_status_ready', 'unknown');\n"
 "        setFieldValue('bridge_status_ready', 'unknown');\n"
 "        setFieldValue('bridge_status_mode', 'unknown');\n"
 "        setFieldValue('bridge_status_error', 'status fetch failed');\n"
@@ -227,6 +237,28 @@ static bool akita_form_get_value(char *body, const char *key, char *output, size
     return false;
 }
 
+static bool akita_hex_string_is_valid(const char *text) {
+    size_t length;
+    size_t index;
+
+    if (text == NULL || text[0] == '\0') {
+        return true;
+    }
+
+    length = strlen(text);
+    if ((length % 2U) != 0U || length > 64U) {
+        return false;
+    }
+
+    for (index = 0; index < length; ++index) {
+        if (!isxdigit((unsigned char) text[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void akita_json_escape(const char *input, char *output, size_t output_size) {
     size_t used = 0;
 
@@ -260,8 +292,9 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
     char obd_name[96];
     char obd_service_uuid[64];
     char obd_characteristic_uuid[64];
-    char response[1184];
+    char response[1280];
 
+    akita_config_lock();
     akita_json_escape(g_runtime_config->vehicle_id, vehicle_id, sizeof(vehicle_id));
     akita_json_escape(g_runtime_config->wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
     akita_json_escape(g_runtime_config->telemetry_endpoint, endpoint, sizeof(endpoint));
@@ -274,15 +307,17 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
         response,
         sizeof(response),
         "{\"vehicle_id\":\"%s\",\"board_name\":\"%s\",\"transport_mode\":\"%s\","
-        "\"wifi_ssid\":\"%s\",\"telemetry_endpoint\":\"%s\",\"reticulum_destination\":\"%s\",\"obd_device_name\":\"%s\","
+        "\"wifi_ssid\":\"%s\",\"wifi_password_configured\":%s,\"telemetry_endpoint\":\"%s\","
+        "\"reticulum_destination\":\"%s\",\"obd_device_name\":\"%s\","
         "\"use_obd_uuid\":%s,\"obd_service_uuid\":\"%s\",\"obd_characteristic_uuid\":\"%s\","
         "\"telemetry_interval_ms\":%lu,\"gps_rx_pin\":%ld,\"gps_tx_pin\":%ld,\"gps_uart_baud\":%lu,"
-        "\"enable_gps\":%s}",
+        "\"enable_gps\":%s,\"lora_frequency_hz\":%lu}",
         vehicle_id,
         akita_board_get_name(g_runtime_config->board_profile),
         (g_runtime_config->transport_mode == AKITA_TRANSPORT_LORA) ? "lora" :
         (g_runtime_config->transport_mode == AKITA_TRANSPORT_WIFI) ? "wifi" : "none",
         wifi_ssid,
+        g_runtime_config->wifi_password[0] != '\0' ? "true" : "false",
         endpoint,
         reticulum_destination,
         obd_name,
@@ -293,8 +328,10 @@ static esp_err_t akita_config_json_handler(httpd_req_t *request) {
         (long) g_runtime_config->gps_rx_pin,
         (long) g_runtime_config->gps_tx_pin,
         (unsigned long) g_runtime_config->gps_uart_baud,
-        g_runtime_config->enable_gps ? "true" : "false"
+        g_runtime_config->enable_gps ? "true" : "false",
+        (unsigned long) g_runtime_config->lora_frequency_hz
     );
+    akita_config_unlock();
 
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
@@ -313,8 +350,12 @@ static esp_err_t akita_status_json_handler(httpd_req_t *request) {
     snprintf(
         response,
         sizeof(response),
-        "{\"transport_ready\":%s,\"bridge_ready\":%s,\"bridge_mode\":\"%s\",\"bridge_last_error\":\"%s\"}",
+        "{\"transport_ready\":%s,\"wifi_connected\":%s,\"wifi_rssi\":%d,\"lora_ready\":%s,"
+        "\"bridge_ready\":%s,\"bridge_mode\":\"%s\",\"bridge_last_error\":\"%s\"}",
         transport_status.transport_ready ? "true" : "false",
+        transport_status.wifi_connected ? "true" : "false",
+        (int) transport_status.wifi_rssi,
+        transport_status.lora_ready ? "true" : "false",
         transport_status.bridge_ready ? "true" : "false",
         bridge_mode,
         bridge_last_error
@@ -325,36 +366,49 @@ static esp_err_t akita_status_json_handler(httpd_req_t *request) {
 }
 
 static esp_err_t akita_config_post_handler(httpd_req_t *request) {
-    char body[1024];
+    char body[2048];
     char scratch[128];
-    char response[160];
+    char response[192];
+    esp_err_t save_err;
     esp_err_t apply_err = ESP_OK;
     int received;
+    int remaining;
 
-    if (request->content_len >= (int) sizeof(body)) {
-        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Config payload too large");
+    if (request->content_len <= 0 || request->content_len >= (int) sizeof(body)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Config payload missing or too large");
     }
 
-    received = httpd_req_recv(request, body, request->content_len);
-    if (received <= 0) {
-        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Config payload missing");
+    remaining = request->content_len;
+    received = 0;
+    while (remaining > 0) {
+        int chunk = httpd_req_recv(request, body + received, remaining);
+        if (chunk <= 0) {
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Config payload missing");
+        }
+        received += chunk;
+        remaining -= chunk;
     }
 
     body[received] = '\0';
 
+    akita_config_lock();
     if (akita_form_get_value(body, "vehicle_id", scratch, sizeof(scratch))) {
         akita_copy_string(g_runtime_config->vehicle_id, sizeof(g_runtime_config->vehicle_id), scratch);
     }
     if (akita_form_get_value(body, "wifi_ssid", scratch, sizeof(scratch))) {
         akita_copy_string(g_runtime_config->wifi_ssid, sizeof(g_runtime_config->wifi_ssid), scratch);
     }
-    if (akita_form_get_value(body, "wifi_password", scratch, sizeof(scratch))) {
+    if (akita_form_get_value(body, "wifi_password", scratch, sizeof(scratch)) && scratch[0] != '\0') {
         akita_copy_string(g_runtime_config->wifi_password, sizeof(g_runtime_config->wifi_password), scratch);
     }
     if (akita_form_get_value(body, "telemetry_endpoint", scratch, sizeof(scratch))) {
         akita_copy_string(g_runtime_config->telemetry_endpoint, sizeof(g_runtime_config->telemetry_endpoint), scratch);
     }
     if (akita_form_get_value(body, "reticulum_destination", scratch, sizeof(scratch))) {
+        if (!akita_hex_string_is_valid(scratch)) {
+            akita_config_unlock();
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Reticulum destination must be hexadecimal");
+        }
         akita_copy_string(g_runtime_config->reticulum_destination, sizeof(g_runtime_config->reticulum_destination), scratch);
     }
     if (akita_form_get_value(body, "obd_device_name", scratch, sizeof(scratch))) {
@@ -378,6 +432,9 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
     if (akita_form_get_value(body, "gps_uart_baud", scratch, sizeof(scratch))) {
         g_runtime_config->gps_uart_baud = (uint32_t) strtoul(scratch, NULL, 10);
     }
+    if (akita_form_get_value(body, "lora_frequency_hz", scratch, sizeof(scratch))) {
+        g_runtime_config->lora_frequency_hz = (uint32_t) strtoul(scratch, NULL, 10);
+    }
     if (akita_form_get_value(body, "transport_mode", scratch, sizeof(scratch))) {
         if (strcmp(scratch, "lora") == 0) {
             g_runtime_config->transport_mode = AKITA_TRANSPORT_LORA;
@@ -390,7 +447,13 @@ static esp_err_t akita_config_post_handler(httpd_req_t *request) {
 
     g_runtime_config->enable_gps = akita_form_contains(body, "enable_gps");
     g_runtime_config->use_obd_uuid = akita_form_contains(body, "use_obd_uuid");
-    ESP_ERROR_CHECK(akita_config_save(g_runtime_config));
+    akita_config_sanitize(g_runtime_config);
+    save_err = akita_config_save(g_runtime_config);
+    akita_config_unlock();
+    if (save_err != ESP_OK) {
+        snprintf(response, sizeof(response), "Save failed: %s", esp_err_to_name(save_err));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, response);
+    }
 
     if (g_apply_callback != NULL) {
         apply_err = g_apply_callback(g_runtime_config, g_apply_callback_context);
@@ -416,14 +479,24 @@ static esp_err_t akita_config_ui_start_wifi(const akita_runtime_config_t *config
         return ESP_OK;
     }
 
-    ESP_ERROR_CHECK(esp_netif_init());
+    err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
     }
 
-    esp_netif_create_default_wifi_ap();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+    if (esp_netif_create_default_wifi_ap() == NULL) {
+        return ESP_FAIL;
+    }
+
+    err = esp_wifi_init(&init_config);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
 
     snprintf((char *) wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", CONFIG_AKITA_CONFIG_PORTAL_SSID);
     wifi_config.ap.ssid_len = strlen((char *) wifi_config.ap.ssid);
@@ -431,14 +504,30 @@ static esp_err_t akita_config_ui_start_wifi(const akita_runtime_config_t *config
     wifi_config.ap.channel = 1;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
 
-    if (strlen(CONFIG_AKITA_CONFIG_PORTAL_PASSWORD) > 0) {
+    if (strlen(CONFIG_AKITA_CONFIG_PORTAL_PASSWORD) >= 8U) {
         snprintf((char *) wifi_config.ap.password, sizeof(wifi_config.ap.password), "%s", CONFIG_AKITA_CONFIG_PORTAL_PASSWORD);
         wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else if (strlen(CONFIG_AKITA_CONFIG_PORTAL_PASSWORD) > 0U) {
+        ESP_LOGW(TAG, "Config portal password is shorter than 8 characters; starting an open AP");
+    } else {
+        ESP_LOGW(TAG, "Config portal password is empty; starting an open AP");
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        return err;
+    }
+
     ESP_LOGI(TAG, "Config AP ready: %s", (char *) wifi_config.ap.ssid);
     ESP_LOGI(TAG, "Board defaults loaded for %s", akita_board_get_name(config->board_profile));
     g_wifi_started = true;
@@ -448,6 +537,7 @@ static esp_err_t akita_config_ui_start_wifi(const akita_runtime_config_t *config
 
 esp_err_t akita_config_ui_start(akita_runtime_config_t *config) {
     httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
+    esp_err_t err;
     httpd_uri_t root_uri = {
         .uri = "/",
         .method = HTTP_GET,
@@ -478,18 +568,37 @@ esp_err_t akita_config_ui_start(akita_runtime_config_t *config) {
     }
 
     g_runtime_config = config;
-    ESP_ERROR_CHECK(akita_config_ui_start_wifi(config));
+    err = akita_config_ui_start_wifi(config);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     if (g_http_running) {
         return ESP_OK;
     }
 
     server_config.server_port = config->config_http_port;
-    ESP_ERROR_CHECK(httpd_start(&g_httpd_handle, &server_config));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &root_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_get_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_post_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_httpd_handle, &api_status_uri));
+    err = httpd_start(&g_httpd_handle, &server_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = httpd_register_uri_handler(g_httpd_handle, &root_uri);
+    if (err == ESP_OK) {
+        err = httpd_register_uri_handler(g_httpd_handle, &api_get_uri);
+    }
+    if (err == ESP_OK) {
+        err = httpd_register_uri_handler(g_httpd_handle, &api_post_uri);
+    }
+    if (err == ESP_OK) {
+        err = httpd_register_uri_handler(g_httpd_handle, &api_status_uri);
+    }
+    if (err != ESP_OK) {
+        httpd_stop(g_httpd_handle);
+        g_httpd_handle = NULL;
+        return err;
+    }
+
     g_http_running = true;
     return ESP_OK;
 }
